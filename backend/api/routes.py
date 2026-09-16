@@ -1,0 +1,1352 @@
+from typing import List, Optional, Any, Dict
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from sqlalchemy.orm import Session
+from backend.database.connection import get_db
+from backend.models.models import (
+    Destination, Hotel, Activity, TransportOption, Trip, TripPreference,
+    User, ItineraryItem, Booking, Alert, Notification, ChangeHistory, Review
+)
+from backend.schemas.schemas import (
+    DestinationRead, HotelRead, ActivityRead, TransportRead,
+    TripCreate, TripRead, TripUpdate, TripPreferenceRead, TripPreferenceUpdate,
+    AIChatRequest, AIChatResponse, AIExtractPreferencesRequest, AIRecommendRequest,
+    AIGenerateItineraryRequest, AIReplanRequest, ResearchContext, ResearchResult,
+    AccommodationContext, AccommodationResult, TransportationContext, TransportationResult,
+    ExperienceContext, ExperienceResult, ItineraryContext, ItineraryResult,
+    TripManagementContext, TripManagementResult, BookingRecommendationContext,
+    BookingRecommendationResult, AssistantChatContext, AssistantChatResult,
+    SerpApiHotelResult, HotelSearchResponse, SelectHotelRequest,
+    LivePlace, PlacesLiveResponse, PlaceImageResponse, SerpApiRestaurantResult, RestaurantSearchResponse
+)
+from backend.ai.gemini_service import gemini_service
+from backend.research.service import DestinationResearchService, ResearchExecutionError
+from backend.accommodation.service import AccommodationRecommendationService, AccommodationExecutionError
+from backend.transportation.service import TransportationRecommendationService, TransportationExecutionError
+from backend.experience.service import ExperienceRecommendationService, ExperienceExecutionError
+from backend.itinerary.service import ItineraryExecutionError, ItineraryRecommendationService, ItineraryValidationError
+from backend.trip.service import TripManagementExecutionError, TripManagementService, TripManagementValidationError
+from backend.booking.service import (
+    BookingRecommendationExecutionError, BookingRecommendationService,
+    BookingRecommendationValidationError,
+)
+from backend.assistant.service import AssistantExecutionError, AssistantService, AssistantValidationError
+from backend.database.config import settings
+from backend.hotels.service import SerpApiError, search_serpapi_hotels
+from backend.recommendation.engine import RecommendationEngine
+from backend.dynamic_destination.service import DynamicDestinationDiscoveryError, DynamicDestinationDiscoveryService
+from backend.itinerary.generator import ItineraryGenerationError, ItineraryGenerator
+from backend.replanning.engine import ReplanningEngine
+import os
+import secrets
+
+router = APIRouter()
+
+
+def _trip_or_404(db: Session, trip_id: str) -> Trip:
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    return trip
+
+
+def _resolve_catalog_destination(db: Session, trip_in: TripCreate) -> Destination:
+    destination = _find_catalog_destination(db, trip_in)
+    if not destination:
+        raise HTTPException(status_code=422, detail="A valid catalog destination is required")
+    return destination
+
+
+def _find_catalog_destination(db: Session, trip_in: TripCreate) -> Optional[Destination]:
+    destination_id = trip_in.destination_id
+    destination_name = trip_in.destination_name
+    if isinstance(trip_in.destination, str):
+        destination_name = destination_name or trip_in.destination
+    elif isinstance(trip_in.destination, dict):
+        destination_id = destination_id or trip_in.destination.get("id")
+        destination_name = destination_name or trip_in.destination.get("name")
+
+    destination = None
+    if destination_id:
+        destination = db.query(Destination).filter(
+            Destination.id == destination_id,
+            Destination.inventory_source == "catalog",
+        ).first()
+    if not destination and destination_name:
+        clean_name = destination_name.strip()
+        destination = db.query(Destination).filter(
+            ((Destination.name.ilike(clean_name)) | (Destination.slug.ilike(clean_name))),
+            Destination.inventory_source == "catalog",
+        ).first()
+    return destination
+
+
+def _requested_destination_name(trip_in: TripCreate) -> Optional[str]:
+    if trip_in.destination_name:
+        return trip_in.destination_name.strip()
+    if isinstance(trip_in.destination, str):
+        return trip_in.destination.strip()
+    if isinstance(trip_in.destination, dict) and trip_in.destination.get("name"):
+        return str(trip_in.destination["name"]).strip()
+    return None
+
+
+def _resolve_or_discover_destination(db: Session, trip_in: TripCreate) -> Destination:
+    destination = _find_catalog_destination(db, trip_in)
+    if destination:
+        return destination
+    if trip_in.destination_id and not _requested_destination_name(trip_in):
+        raise HTTPException(status_code=422, detail="A valid catalog destination is required")
+    destination_name = _requested_destination_name(trip_in)
+    if not destination_name:
+        raise HTTPException(status_code=422, detail="A valid destination name is required")
+    try:
+        return DynamicDestinationDiscoveryService(db, gemini_service).discover_and_persist(
+            trip_in, destination_name, secrets.token_hex(16)
+        )
+    except DynamicDestinationDiscoveryError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=f"Destination research could not be verified: {exc}") from exc
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"Destination research is unavailable: {exc}") from exc
+
+
+def _validate_generation_inventory(db: Session, destination: Destination, currency: str, traveler_count: int, duration_days: int) -> None:
+    currency = (currency or "INR").upper()
+    hotel_filters = [
+        Hotel.destination_id == destination.id,
+        Hotel.currency == currency,
+        Hotel.is_active == True,
+    ]
+    transport_filters = [
+        TransportOption.destination_id == destination.id,
+        TransportOption.currency == currency,
+        TransportOption.capacity >= max(1, traveler_count),
+        TransportOption.is_active == True,
+    ]
+    activity_filters = [
+        Activity.destination_id == destination.id,
+        Activity.currency == currency,
+        Activity.is_active == True,
+    ]
+    if destination.inventory_source == "discovered":
+        scoped_filters = [
+            ("discovery_session_id", destination.discovery_session_id),
+            ("verification_status", "verified_candidate"),
+            ("inventory_source", "discovered"),
+        ]
+        for field, value in scoped_filters:
+            hotel_filters.append(getattr(Hotel, field) == value)
+            transport_filters.append(getattr(TransportOption, field) == value)
+            activity_filters.append(getattr(Activity, field) == value)
+    hotel_count = db.query(Hotel).filter(*hotel_filters).count()
+    transport_count = db.query(TransportOption).filter(*transport_filters).count()
+    activity_count = db.query(Activity).filter(*activity_filters).count()
+    required_activities = max(0, max(1, duration_days) - 1)
+    missing = []
+    if hotel_count == 0:
+        missing.append("hotels")
+    if transport_count == 0:
+        missing.append("transport options")
+    if activity_count < required_activities:
+        missing.append(f"at least {required_activities} distinct activities")
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Catalog inventory for {destination.name} is incomplete: missing {', '.join(missing)}",
+        )
+
+
+def _record_change(db: Session, trip: Trip, action: str, field: str, value: str, reason: str, by: str = "user") -> None:
+    db.add(ChangeHistory(trip_id=trip.id, changed_by=by, action=action,
+                         field_changed=field, new_value=value, reason=reason))
+
+
+def _hotel_option(hotel: Hotel, trip: Trip, badge: str) -> Dict[str, Any]:
+    """Build a frontend AccommodationOption-shaped dict from a catalog Hotel row.
+
+    Pricing follows the traveler-facing rules (rooms = ceil(travelers / 2),
+    nights = max(1, duration_days - 1)). The catalog stores no review counts,
+    so review_count is 0 rather than an invented value.
+    """
+    travelers = trip.traveler_count or 2
+    nights = max(1, (trip.duration_days or 2) - 1)
+    rooms = max(1, -(-travelers // 2))
+    price_per_night = float(hotel.price_per_night or 0) * rooms
+    images = hotel.images or []
+    dest_name = trip.destination.name if trip.destination else ""
+    return {"id": hotel.id, "name": hotel.name, "rating": hotel.rating, "review_count": 0,
+            "category": hotel.category, "location": hotel.address or dest_name,
+            "room_type": f"{rooms}x {hotel.category.title()} Room ({travelers} Guests)",
+            "price_per_night": price_per_night, "total_price": price_per_night * nights,
+            "nights": nights, "amenities": hotel.amenities or [],
+            "why_it_matches": f"Verified catalog {hotel.category} stay in {dest_name} rated {hotel.rating}.",
+            "hero_image": images[0] if images else None, "images": images, "badge": badge}
+
+
+def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
+    """Serialize the persisted trip plus UI-derived selection fields.
+
+    Hotel selection fields are derived from canonical data only: the trip's
+    hotel itinerary items joined to active catalog Hotel rows. No selection
+    is fabricated when the trip has no usable hotel item (selected is None).
+    """
+    itinerary = []
+    for item in trip.itinerary:
+        row = {"id": item.id, "trip_id": item.trip_id, "day_number": item.day_number,
+               "order_index": item.order_index, "item_type": item.item_type, "title": item.title,
+               "description": item.description, "start_time": item.start_time, "end_time": item.end_time,
+               "cost": item.cost, "status": item.status, "hotel_id": item.hotel_id,
+               "activity_id": item.activity_id, "transport_id": item.transport_id,
+               "location": item.location, "meta_data": item.meta_data or {}}
+        row.update((item.meta_data or {}).get("ui", {}))
+        itinerary.append(row)
+    bookings = [{"id": b.id, "trip_id": b.trip_id, "vendor_id": b.vendor_id,
+                 "booking_reference": b.booking_reference, "item_type": b.item_type, "item_id": b.item_id,
+                 "amount": b.amount, "currency": b.currency, "status": b.status,
+                 "payment_status": b.payment_status, "booking_date": b.booking_date.isoformat()} for b in trip.bookings]
+    hotel_items = sorted(
+        [i for i in trip.itinerary if i.item_type == "hotel" and i.hotel is not None and i.hotel.is_active],
+        key=lambda i: (i.day_number, i.order_index),
+    )
+    selected_accommodation = _hotel_option(hotel_items[0].hotel, trip, "best_match") if hotel_items else None
+    selected_id = hotel_items[0].hotel.id if hotel_items else None
+    alternatives: List[Dict[str, Any]] = []
+    if trip.destination_id:
+        query = db.query(Hotel).filter(Hotel.destination_id == trip.destination_id, Hotel.is_active == True)
+        if selected_id:
+            query = query.filter(Hotel.id != selected_id)
+        candidates = query.order_by(Hotel.rating.desc(), Hotel.price_per_night.asc()).limit(4).all()
+        cheapest_id = min(candidates, key=lambda h: h.price_per_night).id if candidates else None
+        top_rated_id = candidates[0].id if candidates else None
+        for hotel in candidates:
+            if hotel.id == cheapest_id:
+                badge = "cheapest"
+            elif hotel.id == top_rated_id:
+                badge = "best_rated"
+            elif hotel.category == "luxury":
+                badge = "luxury"
+            else:
+                badge = "best_match"
+            alternatives.append(_hotel_option(hotel, trip, badge))
+    daily_accommodations = [{"day_number": item.day_number, "hotel": _hotel_option(item.hotel, trip, "best_match")}
+                            for item in hotel_items]
+    return {"id": trip.id, "user_id": trip.user_id, "destination_id": trip.destination_id,
+            "title": trip.title, "status": trip.status, "start_date": trip.start_date.isoformat() if trip.start_date else None,
+            "end_date": trip.end_date.isoformat() if trip.end_date else None, "duration_days": trip.duration_days,
+            "total_budget": trip.total_budget, "currency": trip.currency, "traveler_count": trip.traveler_count,
+            "pace": trip.pace, "discovery_session_id": trip.discovery_session_id,
+            "created_at": trip.created_at.isoformat(), "updated_at": trip.updated_at.isoformat(),
+            "destination": {"id": trip.destination.id, "name": trip.destination.name, "slug": trip.destination.slug,
+                            "country": trip.destination.country, "state_region": trip.destination.state_region,
+                            "description": trip.destination.description, "hero_image_url": trip.destination.hero_image_url,
+                            "best_time_to_visit": trip.destination.best_time_to_visit, "tags": trip.destination.tags or [],
+                            "latitude": trip.destination.latitude, "longitude": trip.destination.longitude,
+                            "source_url": trip.destination.source_url, "evidence": trip.destination.evidence or [],
+                            "inventory_source": trip.destination.inventory_source,
+                            "verification_status": trip.destination.verification_status,
+                            "discovery_session_id": trip.destination.discovery_session_id,
+                            "is_featured": trip.destination.is_featured, "created_at": trip.destination.created_at.isoformat()} if trip.destination else None,
+            "itinerary": itinerary, "bookings": bookings,
+            "selected_accommodation": selected_accommodation,
+            "accommodation_alternatives": alternatives,
+            "daily_accommodations": daily_accommodations,
+            "preferences": {"id": trip.preferences.id, "trip_id": trip.preferences.trip_id,
+                            "budget_tier": trip.preferences.budget_tier, "interests": trip.preferences.interests or [],
+                            "travel_companions": trip.preferences.travel_companions,
+                            "accommodation_types": trip.preferences.accommodation_types or [],
+                            "transport_preferences": trip.preferences.transport_preferences or [],
+                            "dietary_requirements": trip.preferences.dietary_requirements or [],
+                            "special_requests": trip.preferences.special_requests,
+                            "created_at": trip.preferences.created_at.isoformat(),
+                            "updated_at": trip.preferences.updated_at.isoformat()} if trip.preferences else None,
+            "alerts": [{"id": a.id, "trip_id": a.trip_id, "alert_type": a.alert_type, "severity": a.severity,
+                        "title": a.title, "description": a.description, "is_resolved": a.is_resolved,
+                        "created_at": a.created_at.isoformat()} for a in trip.alerts],
+            "notifications": [{"id": n.id, "trip_id": n.trip_id, "user_id": n.user_id, "title": n.title,
+                               "message": n.message, "type": n.type, "is_read": n.is_read,
+                               "created_at": n.created_at.isoformat()} for n in trip.notifications],
+            "change_history": [{"id": h.id, "trip_id": h.trip_id, "changed_by": h.changed_by, "action": h.action,
+                                "field_changed": h.field_changed, "old_value": h.old_value, "new_value": h.new_value,
+                                "reason": h.reason, "timestamp": h.timestamp.isoformat()} for h in trip.change_history]}
+
+# ----------------------------------------------------
+# Health Check API
+# ----------------------------------------------------
+@router.get("/health")
+def health_check(db: Session = Depends(get_db)):
+    """Health check verifying API, DB connectivity, and Gemini AI status."""
+    try:
+        dest_count = db.query(Destination).count()
+        trip_count = db.query(Trip).count()
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+        dest_count = 0
+        trip_count = 0
+
+    return {
+        "status": "healthy",
+        "service": "TourFlow AI API",
+        "version": "1.0.0",
+        "database": db_status,
+        "counts": {
+            "destinations": dest_count,
+            "trips": trip_count
+        },
+        "ai_engine": {
+            "gemini_available": gemini_service.is_available(),
+            "model": "gemini-3.7-flash"
+        }
+    }
+
+# ----------------------------------------------------
+# Frontend sync metadata
+# ----------------------------------------------------
+@router.get("/sync/version")
+def sync_version(db: Session = Depends(get_db)):
+    """Return a lightweight version marker used by the operator frontend."""
+    trips = db.query(Trip).all()
+    latest = max((t.updated_at or t.created_at for t in trips), default=None)
+    version = int(latest.timestamp()) if latest else 0
+    return {
+        "version": version,
+        "timestamp": latest.isoformat() if latest else datetime.utcnow().isoformat() + "Z",
+        "trips_count": len(trips),
+    }
+
+# ----------------------------------------------------
+# Destinations API
+# ----------------------------------------------------
+@router.get("/destinations", response_model=List[DestinationRead])
+def get_destinations(
+    featured_only: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Retrieve list of all destinations or filtered by featured status."""
+    query = db.query(Destination)
+    if featured_only:
+        query = query.filter(Destination.is_featured == True)
+    return query.order_by(Destination.name.asc()).all()
+
+@router.get("/destinations/{id}", response_model=DestinationRead)
+def get_destination_by_id(id: str, db: Session = Depends(get_db)):
+    """Retrieve destination details by ID or Slug."""
+    destination = db.query(Destination).filter(
+        (Destination.id == id) | (Destination.slug == id)
+    ).first()
+    if not destination:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    return destination
+
+# ----------------------------------------------------
+# Hotels API
+# ----------------------------------------------------
+@router.get("/hotels", response_model=List[HotelRead])
+def get_hotels(
+    destination_id: Optional[str] = None,
+    category: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieve hotels with optional destination and category filters."""
+    query = db.query(Hotel).filter(Hotel.is_active == True)
+    if destination_id:
+        query = query.filter(Hotel.destination_id == destination_id)
+    if category:
+        query = query.filter(Hotel.category == category)
+    return query.order_by(Hotel.rating.desc()).all()
+
+@router.get("/hotels/search", response_model=HotelSearchResponse)
+def search_hotels_live(
+    destination: str = Query(min_length=1, max_length=255),
+    check_in_date: str = Query(min_length=8, max_length=10),
+    check_out_date: str = Query(min_length=8, max_length=10),
+    adults: int = Query(default=2, ge=1, le=16),
+    children: int = Query(default=0, ge=0, le=10),
+    currency: str = Query(default="INR", min_length=3, max_length=10),
+    gl: str = Query(default="in", min_length=2, max_length=5),
+    hl: str = Query(default="en", min_length=2, max_length=10),
+    min_price: Optional[float] = Query(default=None, ge=0),
+    max_price: Optional[float] = Query(default=None, ge=0),
+    min_rating: Optional[float] = Query(default=None, ge=0, le=5),
+):
+    """Live hotel search via SerpApi Google Hotels (backend key, normalized)."""
+    from backend.hotels.service import validate_search_dates
+    api_key = (settings.SERPAPI_API_KEY or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Hotel search provider is not configured")
+    try:
+        validate_search_dates(check_in_date, check_out_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        results = search_serpapi_hotels(
+            api_key, settings.SERPAPI_BASE_URL, destination=destination,
+            check_in_date=check_in_date.strip(), check_out_date=check_out_date.strip(),
+            adults=adults, children=children, currency=currency, gl=gl, hl=hl,
+            min_price=min_price, max_price=max_price, min_rating=min_rating,
+            timeout_s=settings.SERPAPI_TIMEOUT_S, max_results=settings.SERPAPI_MAX_RESULTS,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SerpApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"destination": destination.strip(), "check_in_date": check_in_date.strip(),
+            "check_out_date": check_out_date.strip(), "currency": currency.upper(),
+            "results": [SerpApiHotelResult(**item) for item in results], "source": "serpapi"}
+
+@router.get("/places/live", response_model=PlacesLiveResponse)
+def places_live(destination: str = Query(min_length=1, max_length=255),
+                limit: int = Query(default=12, ge=1, le=30),
+                db: Session = Depends(get_db)):
+    """Live places/attractions with provider-backed images (keyless providers).
+
+    Catalog coordinates are preferred; unknown destinations are geocoded.
+    Always 200 (possibly empty) -- never fabricated.
+    """
+    from backend.places.service import get_live_places
+    dest = db.query(Destination).filter(
+        (Destination.name.ilike(destination.strip())) | (Destination.slug.ilike(destination.strip()))
+    ).first()
+    result = get_live_places(
+        destination.strip(),
+        dest.latitude if dest else None, dest.longitude if dest else None, limit,
+        settings.NOMINATIM_API_URL, settings.OVERPASS_API_URL, settings.COMMONS_API_URL,
+        settings.PLACES_TIMEOUT_S, settings.PLACES_RADIUS_M,
+    )
+    return {"destination": result["destination"], "latitude": result["latitude"],
+            "longitude": result["longitude"],
+            "places": [LivePlace(**place) for place in result["places"]],
+            "source": result["source"]}
+
+
+@router.get("/places/image", response_model=PlaceImageResponse)
+def place_image(
+    location: str = Query(min_length=1, max_length=255),
+    destination: Optional[str] = Query(default=None, max_length=255),
+    count: int = Query(default=1, ge=1, le=6),
+):
+    """Real photos for one location via SerpApi Google Images (backend key).
+
+    Returns up to ``count`` distinct relevance-ranked photos from a single
+    provider call. Always 200 with an empty list when nothing real is found --
+    never fabricated, and a provider failure never breaks trip generation.
+    503 when the key is unconfigured; 422 on blank location.
+    """
+    from backend.images.service import get_real_images_for_location
+    api_key = (settings.SERPAPI_API_KEY or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Image search provider is not configured")
+    query = location.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail="location must not be blank")
+    images = get_real_images_for_location(
+        query, (destination or "").strip() or None,
+        api_key, settings.SERPAPI_BASE_URL, settings.SERPAPI_TIMEOUT_S, count,
+    )
+    return {"location": query, "image_url": images[0] if images else None,
+            "images": images, "source": "serpapi_images" if images else "none"}
+
+
+@router.get("/restaurants/search", response_model=RestaurantSearchResponse)
+def search_restaurants_live(
+    destination: str = Query(min_length=1, max_length=255),
+    meal_type: Optional[str] = Query(default=None, max_length=20),
+    cuisine: Optional[str] = Query(default=None, max_length=100),
+    latitude: Optional[float] = Query(default=None, ge=-90, le=90),
+    longitude: Optional[float] = Query(default=None, ge=-180, le=180),
+    min_rating: Optional[float] = Query(default=None, ge=0, le=5),
+    max_results: int = Query(default=8, ge=1, le=20),
+):
+    """Live restaurant search via SerpApi Google Maps (backend key, normalized).
+
+    Returns real local-business candidates only. Empty list when the provider
+    has no results; 503 when the key is unconfigured; 502 on provider failure.
+    """
+    from backend.restaurants.service import SerpApiRestaurantError, search_serpapi_restaurants
+    api_key = (settings.SERPAPI_API_KEY or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Restaurant search provider is not configured")
+    meal = (meal_type or "").strip().lower() or None
+    if meal is not None and meal not in {"breakfast", "brunch", "lunch", "dinner"}:
+        raise HTTPException(status_code=422, detail="meal_type must be breakfast, brunch, lunch, or dinner")
+    try:
+        results = search_serpapi_restaurants(
+            api_key, settings.SERPAPI_BASE_URL, destination=destination.strip(),
+            meal_type=meal, cuisine=(cuisine or "").strip() or None,
+            latitude=latitude, longitude=longitude, min_rating=min_rating,
+            timeout_s=settings.SERPAPI_TIMEOUT_S, max_results=max_results,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SerpApiRestaurantError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"destination": destination.strip(), "meal_type": meal, "cuisine": (cuisine or "").strip() or None,
+            "results": [SerpApiRestaurantResult(**item) for item in results], "source": "serpapi"}
+
+
+# ----------------------------------------------------
+# Activities API
+# ----------------------------------------------------
+@router.get("/activities", response_model=List[ActivityRead])
+def get_activities(
+    destination_id: Optional[str] = None,
+    category: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieve curated activities with optional destination and category filters."""
+    query = db.query(Activity).filter(Activity.is_active == True)
+    if destination_id:
+        query = query.filter(Activity.destination_id == destination_id)
+    if category:
+        query = query.filter(Activity.category == category)
+    return query.order_by(Activity.rating.desc()).all()
+
+# ----------------------------------------------------
+# Transport API
+# ----------------------------------------------------
+@router.get("/transport", response_model=List[TransportRead])
+def get_transport_options(
+    destination_id: Optional[str] = None,
+    type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieve transport options with optional filters."""
+    query = db.query(TransportOption).filter(TransportOption.is_active == True)
+    if destination_id:
+        query = query.filter(TransportOption.destination_id == destination_id)
+    if type:
+        query = query.filter(TransportOption.type == type)
+    return query.all()
+
+# ----------------------------------------------------
+# Trips API (The Central Entity)
+# ----------------------------------------------------
+@router.post("/trips")
+def create_trip(trip_in: TripCreate, db: Session = Depends(get_db)):
+    """
+    Create a new Trip entity with attached preferences, change history,
+    and automatic initial itinerary generation.
+    """
+    # 1. Ensure user exists or use default primary traveler
+    user_id = trip_in.user_id
+    if not user_id:
+        primary_user = db.query(User).first()
+        if not primary_user:
+            primary_user = User(
+                email="alex.traveler@example.com",
+                full_name="Alex Morgan",
+                role="traveler"
+            )
+            db.add(primary_user)
+            db.commit()
+            db.refresh(primary_user)
+        user_id = primary_user.id
+
+    # 2. Resolve the planner's destination name/embedded destination to the
+    # persisted catalog rather than accepting a disconnected frontend object.
+    destination = _resolve_or_discover_destination(db, trip_in)
+    duration_days = trip_in.duration_days or 4
+    currency = trip_in.currency or "INR"
+    traveler_count = trip_in.traveler_count or 2
+    _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
+
+    # 3. Create Trip entity
+    trip = Trip(
+        user_id=user_id,
+        destination_id=destination.id,
+        title=trip_in.title,
+        status=trip_in.status or "planning",
+        start_date=trip_in.start_date,
+        end_date=trip_in.end_date,
+        duration_days=duration_days,
+        total_budget=trip_in.total_budget or 50000.0,
+        currency=currency,
+        traveler_count=traveler_count,
+        pace=trip_in.pace or "balanced",
+        discovery_session_id=destination.discovery_session_id if destination.inventory_source == "discovered" else None
+    )
+    db.add(trip)
+    db.commit()
+    db.refresh(trip)
+
+    # 3. Create Preferences
+    prefs_in = trip_in.preferences
+    pref = TripPreference(
+        trip_id=trip.id,
+        budget_tier=prefs_in.budget_tier if prefs_in else "moderate",
+        interests=prefs_in.interests if prefs_in else ["nature", "culture"],
+        travel_companions=prefs_in.travel_companions if prefs_in else "couple",
+        accommodation_types=prefs_in.accommodation_types if prefs_in else ["boutique"],
+        transport_preferences=prefs_in.transport_preferences if prefs_in else ["private_suv"],
+        dietary_requirements=prefs_in.dietary_requirements if prefs_in else [],
+        special_requests=prefs_in.special_requests if prefs_in else None
+    )
+    db.add(pref)
+
+    # 4. Add Change History Entry
+    history = ChangeHistory(
+        trip_id=trip.id,
+        changed_by="user",
+        action="trip_created",
+        field_changed="all",
+        new_value=trip.title,
+        reason="Initial trip initialized via TourFlow AI Planner"
+    )
+    db.add(history)
+
+    # 5. Add Welcome Notification
+    notification = Notification(
+        trip_id=trip.id,
+        user_id=user_id,
+        title="Trip Created Successfully",
+        message=f"Your trip '{trip.title}' is initialized. AI itinerary is generated and ready for customization.",
+        type="success"
+    )
+    db.add(notification)
+    db.commit()
+
+    # 6. Generate initial itinerary items
+    generator = ItineraryGenerator(db)
+    try:
+        generator.generate_for_trip(trip.id)
+    except ItineraryGenerationError as exc:
+        db.rollback()
+        db.query(ChangeHistory).filter(ChangeHistory.trip_id == trip.id).delete()
+        db.query(Notification).filter(Notification.trip_id == trip.id).delete()
+        db.query(TripPreference).filter(TripPreference.trip_id == trip.id).delete()
+        db.query(ItineraryItem).filter(ItineraryItem.trip_id == trip.id).delete()
+        db.query(Trip).filter(Trip.id == trip.id).delete()
+        db.commit()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    db.refresh(trip)
+    return _trip_dict(trip, db)
+
+@router.get("/trips/{trip_id}")
+def get_trip(trip_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieve full Trip entity with all associated sub-entities:
+    traveler, preferences, itinerary items, bookings, alerts, notifications, change history, reviews.
+    """
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    return _trip_dict(trip, db)
+
+@router.put("/trips/{trip_id}")
+def update_trip(trip_id: str, trip_in: TripUpdate, db: Session = Depends(get_db)):
+    """Update Trip attributes and record change history."""
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+
+    update_data = trip_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        old_val = str(getattr(trip, field, ""))
+        setattr(trip, field, value)
+        # Log to change history
+        history = ChangeHistory(
+            trip_id=trip.id,
+            changed_by="user",
+            action=f"update_{field}",
+            field_changed=field,
+            old_value=old_val,
+            new_value=str(value),
+            reason=f"Traveler modified {field}"
+        )
+        db.add(history)
+
+    db.commit()
+    db.refresh(trip)
+    return _trip_dict(trip, db)
+
+@router.get("/trips/{trip_id}/preferences", response_model=TripPreferenceRead)
+def get_trip_preferences(trip_id: str, db: Session = Depends(get_db)):
+    """Get the preferences for a specific trip."""
+    pref = db.query(TripPreference).filter(TripPreference.trip_id == trip_id).first()
+    if not pref:
+        raise HTTPException(status_code=404, detail="Trip preferences not found")
+    return pref
+
+@router.put("/trips/{trip_id}/preferences", response_model=TripPreferenceRead)
+def update_trip_preferences(
+    trip_id: str,
+    pref_in: TripPreferenceUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update trip preferences and log change history."""
+    pref = db.query(TripPreference).filter(TripPreference.trip_id == trip_id).first()
+    if not pref:
+        # Create if doesn't exist yet
+        pref = TripPreference(trip_id=trip_id)
+        db.add(pref)
+
+    update_data = pref_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(pref, field, value)
+
+    # Log change
+    history = ChangeHistory(
+        trip_id=trip_id,
+        changed_by="user",
+        action="preferences_updated",
+        field_changed="preferences",
+        new_value=str(update_data),
+        reason="Traveler customized travel preferences and constraints"
+    )
+    db.add(history)
+
+    db.commit()
+    db.refresh(pref)
+    return pref
+
+# ----------------------------------------------------
+# AI Planning & Gemini Intelligence APIs
+# ----------------------------------------------------
+def _operator_assistant_response(result: AssistantChatResult) -> Dict[str, Any]:
+    return {
+        "reply": result.response,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "suggested_actions": result.suggested_actions,
+        "trip_id": result.trip_id,
+        "source": result.source,
+        "context_validated": result.context_validated,
+        "references": [ref.model_dump() for ref in result.references],
+    }
+
+
+@router.post("/operator/ai-assistant")
+def operator_ai_assistant(payload: AIChatRequest, db: Session = Depends(get_db)):
+    """
+    Operator-facing Gemini assistant.
+
+    The frontend historically called /api/operator/ai-assistant while the
+    FastAPI backend exposed only /api/ai/chat. Keep the operator route as a
+    compatibility layer and return the response shape expected by the UI.
+    """
+    context_trip_id = payload.trip_id
+    if not context_trip_id and payload.current_trip:
+        current_trip_id = payload.current_trip.get("id") or payload.current_trip.get("trip_id")
+        if current_trip_id:
+            context_trip_id = str(current_trip_id)
+
+    if context_trip_id:
+        assistant_payload = AssistantChatContext(trip_id=context_trip_id, message=payload.message)
+        service = AssistantService(db, gemini_service)
+        try:
+            return _operator_assistant_response(service.execute(assistant_payload))
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AssistantValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AssistantExecutionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    context = dict(payload.session_context or {})
+    result = gemini_service.chat(
+        message=payload.message,
+        session_context=context
+    )
+
+    return {
+        "reply": result.get("response", ""),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "suggested_actions": result.get("suggestions", []),
+    }
+@router.post("/ai/chat", response_model=AIChatResponse)
+def ai_chat(payload: AIChatRequest):
+    """Conversational AI endpoint for travel consultation."""
+    context = dict(payload.session_context or {})
+    if payload.current_trip:
+        context["current_trip"] = payload.current_trip
+    if payload.history:
+        context["history"] = payload.history
+    result = gemini_service.chat(
+        message=payload.message,
+        session_context=context
+    )
+    return result
+
+@router.post("/ai/extract-preferences")
+def ai_extract_preferences(payload: AIExtractPreferencesRequest):
+    """Extract structured travel parameters from natural language prompts."""
+    return gemini_service.extract_preferences(
+        text_prompt=payload.text_prompt,
+        context=payload.context
+    )
+
+@router.post("/research", response_model=ResearchResult)
+def research_destination(payload: ResearchContext, db: Session = Depends(get_db)):
+    """Return non-mutating, catalog-grounded destination research."""
+    service = DestinationResearchService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ResearchExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/accommodations/recommendations", response_model=AccommodationResult)
+def recommend_accommodations(payload: AccommodationContext, db: Session = Depends(get_db)):
+    """Return read-only, catalog-validated accommodation recommendations."""
+    service = AccommodationRecommendationService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AccommodationExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/transportation/recommendations", response_model=TransportationResult)
+def recommend_transportation(payload: TransportationContext, db: Session = Depends(get_db)):
+    """Return read-only, catalog-validated transportation recommendations."""
+    service = TransportationRecommendationService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TransportationExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/experiences/recommendations", response_model=ExperienceResult)
+def recommend_experiences(payload: ExperienceContext, db: Session = Depends(get_db)):
+    """Return read-only, catalog-validated experience recommendations."""
+    service = ExperienceRecommendationService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ExperienceExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/itinerary/recommendations", response_model=ItineraryResult)
+def recommend_itinerary(payload: ItineraryContext, db: Session = Depends(get_db)):
+    """Return a read-only, catalog-validated multi-day itinerary recommendation."""
+    service = ItineraryRecommendationService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ItineraryValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ItineraryExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/trips/management/recommendations", response_model=TripManagementResult)
+def recommend_trip_management(payload: TripManagementContext, db: Session = Depends(get_db)):
+    """Return a read-only, catalog-validated, booking-ready trip-management view."""
+    service = TripManagementService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TripManagementValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except TripManagementExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/bookings/recommendations", response_model=BookingRecommendationResult)
+def recommend_bookings(payload: BookingRecommendationContext, db: Session = Depends(get_db)):
+    """Return a read-only, catalog-validated booking-readiness view for a trip."""
+    service = BookingRecommendationService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except BookingRecommendationValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BookingRecommendationExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/assistant/chat", response_model=AssistantChatResult)
+def assistant_chat(payload: AssistantChatContext, db: Session = Depends(get_db)):
+    """Answer a traveler question from read-only, validated trip context."""
+    service = AssistantService(db, gemini_service)
+    try:
+        return service.execute(payload)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AssistantValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AssistantExecutionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+@router.post("/ai/recommend")
+def ai_recommend(payload: AIRecommendRequest, db: Session = Depends(get_db)):
+    """Get AI recommendation insights alongside matching catalogue items."""
+    engine = RecommendationEngine(db)
+    return engine.get_recommendations(
+        destination_id=payload.destination_id,
+        preferences=payload.preferences
+    )
+
+@router.post("/ai/generate-itinerary")
+def ai_generate_itinerary(payload: AIGenerateItineraryRequest, db: Session = Depends(get_db)):
+    """Generate dynamic day-by-day itinerary schema."""
+    if payload.trip_id:
+        generator = ItineraryGenerator(db)
+        try:
+            items = generator.generate_for_trip(payload.trip_id)
+        except ItineraryGenerationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        trip = db.query(Trip).filter(Trip.id == payload.trip_id).first()
+        return {
+            "status": "success",
+            "trip_id": payload.trip_id,
+            "items_count": len(items),
+            "trip": trip
+        }
+    raise HTTPException(status_code=422, detail="trip_id is required for catalog-grounded itinerary generation")
+
+
+@router.post("/trips/{trip_id}/optimize")
+def optimize_trip_itinerary(trip_id: str, db: Session = Depends(get_db)):
+    """Replace proposed catalog selections with deterministic ranked selections."""
+    trip = _trip_or_404(db, trip_id)
+    try:
+        items = ItineraryGenerator(db).optimize_for_trip(trip.id)
+    except ItineraryGenerationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    db.refresh(trip)
+    return {
+        "status": "success",
+        "trip_id": trip.id,
+        "items_count": len(items),
+        "trip": _trip_dict(trip, db),
+    }
+
+
+@router.post("/ai/replan")
+def ai_replan(payload: AIReplanRequest, db: Session = Depends(get_db)):
+    """Dynamically adjust itinerary based on external disruption event."""
+    engine = ReplanningEngine(db)
+    return engine.handle_disruption(
+        trip_id=payload.trip_id,
+        trigger_event=payload.trigger_event
+    )
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL-backed compatibility routes used by the current React client.
+# These replace Express's in-memory implementations without inventing data.
+# ---------------------------------------------------------------------------
+@router.get("/trips")
+def list_trips(status: Optional[str] = None, search: Optional[str] = None,
+               operator_id: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(Trip)
+    if status:
+        query = query.filter(Trip.status == status)
+    if search:
+        like = f"%{search}%"
+        query = query.filter((Trip.title.ilike(like)) | (Trip.id.ilike(like)))
+    # The persisted schema has no operator assignment. Keep this query accepted
+    # for client compatibility, but never fabricate an assignment.
+    return [_trip_dict(t, db) for t in query.order_by(Trip.updated_at.desc()).all()]
+
+
+@router.delete("/trips/{trip_id}")
+def delete_trip(trip_id: str, db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    db.delete(trip)
+    db.commit()
+    return {"success": True, "message": "Trip deleted"}
+
+
+@router.post("/trips/{trip_id}/trigger-disruption")
+def trigger_disruption(trip_id: str, db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    alert = Alert(trip_id=trip.id, alert_type="weather", severity="critical",
+                  title="Operational disruption reported",
+                  description="A disruption was reported and requires itinerary review.")
+    db.add(alert)
+    _record_change(db, trip, "disruption_triggered", "alerts", alert.title, alert.description, "operator")
+    db.commit(); db.refresh(trip)
+    return {"success": True, "trip": _trip_dict(trip, db)}
+
+
+@router.post("/trips/{trip_id}/impact-analysis")
+def impact_analysis(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    disruption = payload.get("disruption") or {}
+    unresolved = [a for a in trip.alerts if not a.is_resolved]
+    affected = [i for i in trip.itinerary if i.status in ("proposed", "confirmed")]
+    exposure = sum(b.amount for b in trip.bookings if b.status in ("pending", "cancelled"))
+    return {"trip_id": trip.id, "disruption": disruption, "affected_items_count": len(affected),
+            "unresolved_alerts_count": len(unresolved), "financial_exposure": {
+                "unfulfilled_booking_cost": exposure, "currency": trip.currency},
+            "recommendation": "Review active itinerary items and select a database-backed alternative."}
+
+
+@router.post("/trips/{trip_id}/ai-replan-options")
+def ai_replan_options(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    if not trip.destination_id:
+        raise HTTPException(status_code=400, detail="Trip has no destination")
+    active_ids = {i.activity_id for i in trip.itinerary if i.activity_id}
+    candidates = db.query(Activity).filter(Activity.destination_id == trip.destination_id,
+                                           Activity.is_active == True).all()
+    return {"trip_id": trip.id, "candidates": [{"id": a.id, "title": a.title,
+            "description": a.description, "cost": a.price_per_person * trip.traveler_count,
+            "vendor_name": a.vendor.name if a.vendor else None, "location": a.meeting_point,
+            "match_score": 1.0 if a.id not in active_ids else 0.7,
+            "ai_rationale": "Available catalog activity for this trip destination."} for a in candidates]}
+
+
+@router.post("/trips/{trip_id}/apply-replan")
+def apply_replan(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    activity_id = payload.get("alternative_id")
+    activity = db.query(Activity).filter(Activity.id == activity_id, Activity.is_active == True).first()
+    if not activity or activity.destination_id != trip.destination_id:
+        raise HTTPException(status_code=400, detail="Replan alternative is unavailable for this trip")
+    target = next((i for i in trip.itinerary if i.item_type == "activity" and i.status != "completed"), None)
+    if target is None:
+        target = ItineraryItem(trip_id=trip.id, day_number=1, order_index=len(trip.itinerary) + 1,
+                               item_type="activity", title=activity.title)
+        db.add(target)
+    target.activity_id, target.title, target.description = activity.id, activity.title, activity.description
+    target.location, target.cost, target.status = activity.meeting_point, activity.price_per_person * trip.traveler_count, "confirmed"
+    for alert in trip.alerts:
+        if not alert.is_resolved:
+            alert.is_resolved = True
+    _record_change(db, trip, "replan_applied", "itinerary", activity.title,
+                   payload.get("notes") or "Operator approved an available destination activity.", "operator")
+    db.add(Notification(trip_id=trip.id, user_id=trip.user_id, title="Itinerary updated",
+                        message=f"Your itinerary has been updated to include {activity.title}.", type="update"))
+    db.commit(); db.refresh(trip)
+    return {"success": True, "summary": {"new_activity": activity.title,
+            "booking_reference": None, "cost_savings": 0}, "trip": _trip_dict(trip, db)}
+
+
+def _set_trip_request_status(trip_id: str, status: str, db: Session):
+    trip = _trip_or_404(db, trip_id)
+    trip.status = status
+    _record_change(db, trip, f"request_{status}", "status", status, f"Trip request {status} by operator.", "operator")
+    db.commit(); db.refresh(trip)
+    return {"success": True, "trip": _trip_dict(trip, db)}
+
+
+@router.post("/trips/{trip_id}/accept-request")
+def accept_trip_request(trip_id: str, db: Session = Depends(get_db)):
+    return _set_trip_request_status(trip_id, "confirmed", db)
+
+
+@router.post("/trips/{trip_id}/decline-request")
+def decline_trip_request(trip_id: str, db: Session = Depends(get_db)):
+    return _set_trip_request_status(trip_id, "cancelled", db)
+
+
+@router.get("/operator/dashboard")
+def operator_dashboard(db: Session = Depends(get_db)):
+    trips = db.query(Trip).all()
+    return {"total_trips": len(trips), "planning_trips": sum(t.status == "planning" for t in trips),
+            "active_trips": sum(t.status in ("confirmed", "ongoing") for t in trips),
+            "unresolved_alerts": db.query(Alert).filter(Alert.is_resolved == False).count(),
+            "pending_bookings": db.query(Booking).filter(Booking.status == "pending").count()}
+
+
+def _vendor_dict(vendor: Any) -> Dict[str, Any]:
+    return {"id": vendor.id, "name": vendor.name, "category": vendor.vendor_type,
+            "location": None, "phone": vendor.phone, "contact_person": vendor.contact_email,
+            "rating": vendor.rating, "is_available": vendor.is_verified,
+            "active_bookings_count": sum(b.status in ("pending", "confirmed") for b in vendor.bookings)}
+
+
+@router.get("/operator/vendors")
+def operator_vendors(db: Session = Depends(get_db)):
+    from backend.models.models import Vendor
+    return [_vendor_dict(v) for v in db.query(Vendor).order_by(Vendor.name).all()]
+
+
+@router.post("/operator/vendors/{vendor_id}/toggle")
+def toggle_vendor(vendor_id: str, db: Session = Depends(get_db)):
+    from backend.models.models import Vendor
+    vendor = db.query(Vendor).filter(Vendor.id == vendor_id).first()
+    if not vendor:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    vendor.is_verified = not vendor.is_verified
+    db.commit(); db.refresh(vendor)
+    return _vendor_dict(vendor)
+
+
+def _booking_dict(booking: Booking) -> Dict[str, Any]:
+    return {"id": booking.id, "trip_id": booking.trip_id, "vendor_id": booking.vendor_id,
+            "booking_reference": booking.booking_reference, "item_type": booking.item_type,
+            "item_id": booking.item_id, "amount": booking.amount, "currency": booking.currency,
+            "status": booking.status, "payment_status": booking.payment_status,
+            "booking_date": booking.booking_date.isoformat()}
+
+
+@router.get("/operator/bookings")
+def operator_bookings(db: Session = Depends(get_db)):
+    return [_booking_dict(b) for b in db.query(Booking).order_by(Booking.booking_date.desc()).all()]
+
+
+@router.post("/operator/bookings/{booking_id}/action")
+def operator_booking_action(booking_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    action = payload.get("action")
+    if action not in {"confirm", "cancel", "rebook"}:
+        raise HTTPException(status_code=422, detail="Action must be confirm, cancel, or rebook")
+    booking.status = {"confirm": "confirmed", "cancel": "cancelled", "rebook": "pending"}[action]
+    _record_change(db, booking.trip, f"booking_{action}", "booking", booking.booking_reference,
+                   f"Operator requested booking {action}.", "operator")
+    db.commit(); db.refresh(booking)
+    return _booking_dict(booking)
+
+
+@router.get("/operator/alerts")
+def operator_alerts(db: Session = Depends(get_db)):
+    return [{"id": a.id, "trip_id": a.trip_id, "alert_type": a.alert_type, "severity": a.severity,
+             "title": a.title, "description": a.description, "is_resolved": a.is_resolved,
+             "created_at": a.created_at.isoformat()} for a in db.query(Alert).order_by(Alert.created_at.desc()).all()]
+
+
+@router.post("/operator/alerts/{alert_id}/resolve")
+def resolve_operator_alert(alert_id: str, db: Session = Depends(get_db)):
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert.is_resolved = True
+    _record_change(db, alert.trip, "alert_resolved", "alert", alert.title, "Operator resolved alert.", "operator")
+    db.commit()
+    return {"success": True, "alert_id": alert.id}
+
+
+@router.get("/operator/analytics")
+def operator_analytics(db: Session = Depends(get_db)):
+    trips = db.query(Trip).all()
+    bookings = db.query(Booking).all()
+    return {"overview": {"total_tours_operated": len(trips),
+            "active_tours": sum(t.status in ("confirmed", "ongoing") for t in trips),
+            "total_travelers_hosted": sum(t.traveler_count for t in trips),
+            "total_gross_revenue": sum(b.amount for b in bookings if b.status == "confirmed"),
+            "disruption_recovery_rate": 0 if not db.query(Alert).count() else round(100 * db.query(Alert).filter(Alert.is_resolved == True).count() / db.query(Alert).count(), 1)}}
+
+
+@router.post("/auth/operator-login")
+def operator_login(payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    email, password = (payload.get("email") or "").strip().lower(), payload.get("password") or ""
+    configured_password = os.getenv("OPERATOR_LOGIN_PASSWORD")
+    if not configured_password:
+        raise HTTPException(status_code=503, detail="Operator login is not configured")
+    user = db.query(User).filter(User.email == email, User.role.in_(["operator", "admin"]), User.is_active == True).first()
+    if not user or not secrets.compare_digest(password, configured_password):
+        raise HTTPException(status_code=401, detail="Invalid operator credentials")
+    return {"success": True, "user": {"id": user.id, "email": user.email, "name": user.full_name,
+            "role": user.role, "operator_name": user.full_name}, "token": secrets.token_urlsafe(32)}
+
+
+def _commit_trip(db: Session, trip: Trip, action: str, field: str, value: str, reason: str) -> Dict[str, Any]:
+    _record_change(db, trip, action, field, value, reason)
+    db.commit(); db.refresh(trip)
+    return _trip_dict(trip, db)
+
+
+@router.post("/trips/{trip_id}/change-transport")
+def change_transport(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    transport = db.query(TransportOption).filter(TransportOption.id == payload.get("transport_id"),
+                                                  TransportOption.destination_id == trip.destination_id,
+                                                  TransportOption.is_active == True).first()
+    if not transport:
+        raise HTTPException(status_code=400, detail="Transport option not found")
+    item = next((i for i in trip.itinerary if i.item_type == "transport"), None)
+    if not item:
+        item = ItineraryItem(trip_id=trip.id, day_number=1, order_index=1, item_type="transport", title=transport.name)
+        db.add(item)
+    item.transport_id, item.title, item.description, item.cost, item.status = transport.id, transport.name, f"{transport.route_from} to {transport.route_to}", transport.price, "confirmed"
+    return _commit_trip(db, trip, "transport_changed", "transport", transport.name, "Traveler selected a catalog transport option.")
+
+
+def _change_accommodation(trip_id: str, payload: Dict[str, Any], db: Session, daily: bool) -> Dict[str, Any]:
+    trip = _trip_or_404(db, trip_id)
+    hotel = db.query(Hotel).filter(Hotel.id == payload.get("accommodation_id"), Hotel.destination_id == trip.destination_id,
+                                   Hotel.is_active == True).first()
+    if not hotel:
+        raise HTTPException(status_code=400, detail="Accommodation option not found")
+    day = int(payload.get("day_number") or 1) if daily else 1
+    item = next((i for i in trip.itinerary if i.item_type == "hotel" and i.day_number == day), None)
+    if not item:
+        item = ItineraryItem(trip_id=trip.id, day_number=day, order_index=99, item_type="hotel", title=hotel.name)
+        db.add(item)
+    item.hotel_id, item.title, item.description, item.location, item.cost, item.status = hotel.id, hotel.name, hotel.description, hotel.address, hotel.price_per_night, "confirmed"
+    return _commit_trip(db, trip, "hotel_changed", "hotel", hotel.name, "Traveler selected a catalog hotel.")
+
+
+@router.post("/trips/{trip_id}/change-accommodation")
+def change_accommodation(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    return _change_accommodation(trip_id, payload, db, False)
+
+
+@router.post("/trips/{trip_id}/change-daily-accommodation")
+@router.post("/trips/{trip_id}/change-day-accommodation")
+def change_daily_accommodation(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    return _change_accommodation(trip_id, payload, db, True)
+
+
+@router.post("/trips/{trip_id}/select-hotel")
+def select_hotel(trip_id: str, selection: SelectHotelRequest, db: Session = Depends(get_db)):
+    """Persist a traveler-selected (e.g. SerpApi live) hotel against the trip.
+
+    Reuses the existing itinerary hotel-item structure: hotel_id stays None
+    (no catalog row exists) while the property token, dates, price, and
+    provider metadata are retained in meta_data for later identification.
+    """
+    trip = _trip_or_404(db, trip_id)
+    total = selection.total_price
+    if total is None and selection.price_per_night is not None:
+        total = selection.price_per_night * max(1, (trip.duration_days or 2) - 1)
+    item = next((i for i in trip.itinerary if i.item_type == "hotel" and i.day_number == selection.day_number), None)
+    if not item:
+        item = ItineraryItem(trip_id=trip.id, day_number=selection.day_number, order_index=99,
+                             item_type="hotel", title=selection.name)
+        db.add(item)
+    item.hotel_id = None
+    item.title = selection.name
+    item.description = selection.description
+    item.location = selection.location
+    item.cost = float(total or 0)
+    item.status = "confirmed"
+    item.meta_data = {"provider": "serpapi", "property_token": selection.property_token,
+                      "name": selection.name, "location": selection.location,
+                      "image_url": selection.image_url, "description": selection.description,
+                      "price_per_night": selection.price_per_night, "total_price": total,
+                      "currency": (selection.currency or trip.currency or "INR").upper(),
+                      "rating": selection.rating, "hotel_class": selection.hotel_class,
+                      "amenities": selection.amenities or [],
+                      "check_in_date": selection.check_in_date, "check_out_date": selection.check_out_date}
+    return _commit_trip(db, trip, "hotel_selected", "hotel", selection.name,
+                        "Traveler selected a live hotel search result.")
+
+
+@router.post("/trips/{trip_id}/add-activity")
+def add_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Activity title is required")
+    day = int(payload.get("day_number") or 1)
+    item = ItineraryItem(trip_id=trip.id, day_number=day,
+        order_index=max([i.order_index for i in trip.itinerary if i.day_number == day] or [0]) + 1,
+        item_type=payload.get("item_type") or "activity", title=title, description=payload.get("description"),
+        start_time=payload.get("start_time"), end_time=payload.get("end_time"), cost=float(payload.get("cost") or 0),
+        location=payload.get("location"), status="confirmed",
+        meta_data={"ui": {k: payload[k] for k in ("image_url", "duration", "walking_intensity", "rest_buffer_minutes") if k in payload}})
+    db.add(item)
+    return _commit_trip(db, trip, "item_added", "itinerary", title, "Traveler added a custom itinerary activity.")
+
+
+@router.post("/trips/{trip_id}/delete-activity")
+def delete_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Itinerary item not found")
+    title = item.title; db.delete(item)
+    return _commit_trip(db, trip, "item_deleted", "itinerary", title, "Traveler deleted an itinerary item.")
+
+
+@router.post("/trips/{trip_id}/swap-activity")
+def swap_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Itinerary item not found")
+    for field in ("title", "description", "cost"):
+        if payload.get(f"new_{field}") is not None: setattr(item, field, payload[f"new_{field}"])
+    if payload.get("new_image_url"):
+        item.meta_data = {**(item.meta_data or {}), "ui": {**(item.meta_data or {}).get("ui", {}), "image_url": payload["new_image_url"]}}
+    return _commit_trip(db, trip, "activity_swapped", "itinerary", item.title, "Traveler swapped an itinerary activity.")
+
+
+@router.post("/trips/{trip_id}/edit-activity")
+def edit_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Itinerary item not found")
+    for field in ("title", "description", "start_time", "end_time", "cost"):
+        if field in payload and payload[field] is not None: setattr(item, field, payload[field])
+    return _commit_trip(db, trip, "activity_edited", "itinerary", item.title, "Traveler edited an itinerary activity.")
+
+
+@router.post("/trips/{trip_id}/toggle-activity")
+def toggle_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Itinerary item not found")
+    item.status = "confirmed" if item.status == "skipped" else "skipped"
+    return _commit_trip(db, trip, "activity_toggled", "itinerary", item.title, f"Activity marked {item.status}.")
+
+
+@router.post("/trips/{trip_id}/add-day-leg")
+def add_day_leg(trip_id: str, db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    trip.duration_days += 1
+    day = trip.duration_days
+    db.add(ItineraryItem(trip_id=trip.id, day_number=day, order_index=1, item_type="leisure",
+           title="Free time for local exploration", description="Flexible time reserved for traveler-selected activities.",
+           cost=0, status="proposed", location=trip.destination.name if trip.destination else None))
+    return _commit_trip(db, trip, "day_leg_added", "duration_days", str(day), "Trip duration extended by one day.")
+
+
+@router.post("/trips/{trip_id}/remove-day-leg")
+def remove_day_leg(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    if trip.duration_days <= 2:
+        raise HTTPException(status_code=400, detail="Trip cannot have less than 2 days")
+    day = int(payload.get("day_number") or trip.duration_days)
+    db.query(ItineraryItem).filter(ItineraryItem.trip_id == trip.id, ItineraryItem.day_number == day).delete()
+    for item in db.query(ItineraryItem).filter(ItineraryItem.trip_id == trip.id, ItineraryItem.day_number > day):
+        item.day_number -= 1
+    trip.duration_days -= 1
+    return _commit_trip(db, trip, "day_leg_removed", "duration_days", str(trip.duration_days), "Trip duration reduced by one day.")
+
+
+@router.get("/possible-options")
+def possible_options(destination: str, trip_id: Optional[str] = None, db: Session = Depends(get_db)):
+    dest = db.query(Destination).filter((Destination.name.ilike(destination)) | (Destination.slug.ilike(destination))).first()
+    if not dest:
+        return []
+    return [{"id": a.id, "title": a.title, "category": a.category, "location": a.meeting_point or dest.name,
+             "duration": f"{a.duration_hours:g} hours", "cost": a.price_per_person,
+             "description": a.description, "image_url": (a.images or [None])[0],
+             "tags": [a.category], "walking_intensity": "moderate"} for a in
+            db.query(Activity).filter(Activity.destination_id == dest.id, Activity.is_active == True).all()]
+
+
+@router.post("/trips/{trip_id}/lock-booking")
+def lock_booking(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    trip = _trip_or_404(db, trip_id)
+    details = payload.get("details") or {}
+    item_id, item_type = payload.get("item_id"), payload.get("item_type") or "service"
+    vendor_id = None
+    if item_type == "hotel" and item_id:
+        record = db.query(Hotel).filter(Hotel.id == item_id).first(); vendor_id = record.vendor_id if record else None
+    elif item_type == "activity" and item_id:
+        record = db.query(Activity).filter(Activity.id == item_id).first(); vendor_id = record.vendor_id if record else None
+    elif item_type == "transport" and item_id:
+        record = db.query(TransportOption).filter(TransportOption.id == item_id).first(); vendor_id = record.vendor_id if record else None
+    mode = payload.get("booking_mode")
+    if mode not in {"ai_guide", "self_booking"}:
+        raise HTTPException(status_code=422, detail="booking_mode must be ai_guide or self_booking")
+    booking = Booking(trip_id=trip.id, vendor_id=vendor_id, item_type=item_type, item_id=item_id,
+        amount=float(details.get("amount") or 0), currency=trip.currency,
+        status="confirmed" if mode == "ai_guide" else "pending", payment_status="paid" if mode == "ai_guide" else "pending")
+    db.add(booking); db.flush()
+    _record_change(db, trip, "booking_locked", "booking", booking.booking_reference, "Booking choice saved.", "ai" if mode == "ai_guide" else "user")
+    db.commit(); db.refresh(trip)
+    return {"success": True, "booking": _booking_dict(booking), "trip": _trip_dict(trip, db)}
