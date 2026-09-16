@@ -246,6 +246,15 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
             alternatives.append(_hotel_option(hotel, trip, badge))
     daily_accommodations = [{"day_number": item.day_number, "hotel": _hotel_option(item.hotel, trip, "best_match")}
                             for item in hotel_items]
+    transport_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "transport")
+    accommodation_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "hotel")
+    activities_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "activity")
+    total_cost = transport_cost + accommodation_cost + activities_cost
+    target_budget = float(trip.total_budget or 0)
+    cost_breakdown = {"transport": transport_cost, "accommodation": accommodation_cost,
+                      "activities": activities_cost, "food_and_other": 0.0, "total": total_cost,
+                      "target_budget": target_budget, "remaining_budget": target_budget - total_cost,
+                      "is_under_budget": total_cost <= target_budget}
     return {"id": trip.id, "user_id": trip.user_id, "destination_id": trip.destination_id,
             "title": trip.title, "status": trip.status, "start_date": trip.start_date.isoformat() if trip.start_date else None,
             "end_date": trip.end_date.isoformat() if trip.end_date else None, "duration_days": trip.duration_days,
@@ -265,6 +274,7 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                             "discovery_session_id": trip.destination.discovery_session_id,
                             "is_featured": trip.destination.is_featured, "created_at": trip.destination.created_at.isoformat()} if trip.destination else None,
             "itinerary": itinerary, "bookings": bookings,
+            "total_cost": total_cost, "cost_breakdown": cost_breakdown,
             "selected_accommodation": selected_accommodation,
             "accommodation_alternatives": alternatives,
             "daily_accommodations": daily_accommodations,
@@ -1086,7 +1096,26 @@ def create_trip(trip_in: TripCreate, db: Session = Depends(get_db)):
     duration_days = trip_in.duration_days or 4
     currency = trip_in.currency or "INR"
     traveler_count = trip_in.traveler_count or 2
-    _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
+    try:
+        _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
+    except HTTPException as exc:
+        # A catalog row may exist without usable inventory. Fall back to the
+        # verified dynamic-discovery flow instead of stranding the traveler;
+        # complete catalog destinations never reach this branch.
+        if destination.inventory_source != "catalog" or exc.status_code != 422:
+            raise
+        fallback_name = _requested_destination_name(trip_in) or destination.name
+        try:
+            destination = DynamicDestinationDiscoveryService(db, gemini_service).discover_and_persist(
+                trip_in, fallback_name, secrets.token_hex(16)
+            )
+        except DynamicDestinationDiscoveryError as discovery_exc:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=f"Destination research could not be verified: {discovery_exc}") from discovery_exc
+        except RuntimeError as discovery_exc:
+            db.rollback()
+            raise HTTPException(status_code=503, detail=f"Destination research is unavailable: {discovery_exc}") from discovery_exc
+        _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
 
     # 3. Create Trip entity
     trip = Trip(

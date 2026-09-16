@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,12 @@ class DynamicDestinationDiscoveryError(Exception):
     """Raised when researched destination inventory cannot be verified."""
 
 
+# Upper bound on research calls per discovery: the initial request plus
+# follow-ups for activity shortfalls. Keeps the pipeline fail-closed instead
+# of looping against a provider that cannot verify enough candidates.
+MAX_ACTIVITY_RESEARCH_ATTEMPTS = 3
+
+
 class DynamicDestinationDiscoveryService:
     """Convert sourced research candidates into verified catalog inventory."""
 
@@ -24,24 +30,55 @@ class DynamicDestinationDiscoveryService:
         self.research_client = research_client
 
     def discover_and_persist(self, trip_in: Any, destination_name: str, discovery_session_id: str) -> Destination:
-        payload = self.research_client.discover_destination_inventory(
-            {
-                "destination": destination_name,
-                "duration_days": int(trip_in.duration_days or 4),
-                "budget": float(trip_in.total_budget or 50000.0),
-                "currency": (trip_in.currency or "INR").upper(),
-                "traveler_count": int(trip_in.traveler_count or 2),
-                "pace": trip_in.pace or "balanced",
-                "preferences": trip_in.preferences.model_dump() if trip_in.preferences else {},
-                "discovery_session_id": discovery_session_id,
-            }
-        )
-        destination_data = self._destination(payload, destination_name)
-        activities = self._entities(payload, "activities")
-        hotels = self._entities(payload, "hotels")
-        transports = self._entities(payload, "transport_options")
-
+        base_request = {
+            "destination": destination_name,
+            "duration_days": int(trip_in.duration_days or 4),
+            "budget": float(trip_in.total_budget or 50000.0),
+            "currency": (trip_in.currency or "INR").upper(),
+            "traveler_count": int(trip_in.traveler_count or 2),
+            "pace": trip_in.pace or "balanced",
+            "preferences": trip_in.preferences.model_dump() if trip_in.preferences else {},
+            "discovery_session_id": discovery_session_id,
+        }
         required_activity_count = max(1, int(trip_in.duration_days or 4) - 1)
+        # Best-effort coverage: one verified activity per trip day when research
+        # yields more than the fail-closed minimum. Bounded by follow-up
+        # attempts and the recommendation cap; never fabricated.
+        coverage_target = max(required_activity_count, min(int(trip_in.duration_days or 4), 6))
+        destination_data: Dict[str, Any] = {}
+        hotels: List[Dict[str, Any]] = []
+        transports: List[Dict[str, Any]] = []
+        activities: List[Dict[str, Any]] = []
+        seen_activity_names = set()
+        verified_activity_names: List[str] = []
+        first_attempt = True
+        for _ in range(MAX_ACTIVITY_RESEARCH_ATTEMPTS):
+            request = dict(base_request)
+            if activities:
+                # Steer follow-up research toward still-missing, destination-specific
+                # candidates; the research client echoes unknown keys into its prompt.
+                request["already_verified_activity_names"] = sorted(verified_activity_names)
+                request["additional_activities_needed"] = coverage_target - len(activities)
+            payload = self.research_client.discover_destination_inventory(request)
+            destination_data = self._destination(payload, destination_name)
+            batch_activities = self._entities(payload, "activities")
+            batch_hotels = self._entities(payload, "hotels")
+            batch_transports = self._entities(payload, "transport_options")
+            if first_attempt:
+                # Hotel/transport handling is intentionally unchanged: only the
+                # initial attempt supplies them; follow-ups only top up activities.
+                hotels = batch_hotels
+                transports = batch_transports
+                first_attempt = False
+            for activity in batch_activities:
+                key = activity["name"].casefold()
+                if key not in seen_activity_names:
+                    seen_activity_names.add(key)
+                    verified_activity_names.append(activity["name"])
+                    activities.append(activity)
+            if len(activities) >= coverage_target:
+                break
+
         if len(activities) < required_activity_count:
             raise DynamicDestinationDiscoveryError(
                 f"Research returned {len(activities)} verified activities; {required_activity_count} are required"
@@ -101,6 +138,7 @@ class DynamicDestinationDiscoveryService:
         stable_id = self._stable_id("dyn-hotel", discovery_session_id, data["name"])
         if self.db.query(Hotel).filter(Hotel.id == stable_id).first():
             return
+        address = (data.get("address") or "").strip() or None
         self.db.add(Hotel(
             id=stable_id,
             destination_id=destination.id,
@@ -108,8 +146,8 @@ class DynamicDestinationDiscoveryService:
             category=data.get("category") or "mid-range",
             price_per_night=float(data["price_per_night"]),
             currency=data.get("currency") or currency,
-            rating=float(data.get("rating") or 4.2),
-            address=data.get("address") or data["name"],
+            rating=self._optional_rating(data, data["name"]),
+            address=address,
             amenities=self._list(data.get("amenities")),
             images=[],
             description=data.get("description"),
@@ -136,7 +174,7 @@ class DynamicDestinationDiscoveryService:
             price_per_person=float(data.get("price_per_person") or 0.0),
             currency=data.get("currency") or currency,
             difficulty_level=data.get("difficulty_level") or "easy",
-            rating=float(data.get("rating") or 4.4),
+            rating=self._optional_rating(data, data["name"]),
             images=[],
             description=data.get("description"),
             meeting_point=data.get("area") or data["name"],
@@ -236,6 +274,22 @@ class DynamicDestinationDiscoveryService:
         if key == "longitude" and not -180 <= coord <= 180:
             raise DynamicDestinationDiscoveryError(f"{name} has invalid longitude")
         return coord
+
+    @staticmethod
+    def _optional_rating(data: Dict[str, Any], name: str) -> Optional[float]:
+        # Ratings are provider-supplied or unknown (None) -- never defaulted.
+        # A default rating would fabricate quality evidence for inventory the
+        # provider never scored.
+        raw = data.get("rating")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        try:
+            rating = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise DynamicDestinationDiscoveryError(f"{name} has invalid rating") from exc
+        if rating < 0 or rating > 5:
+            raise DynamicDestinationDiscoveryError(f"{name} has invalid rating")
+        return rating
 
     def _required_money(self, data: Dict[str, Any], key: str, name: str) -> float:
         amount = self._optional_money(data, key, name)

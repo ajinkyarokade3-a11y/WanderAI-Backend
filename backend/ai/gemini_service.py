@@ -6,6 +6,22 @@ from backend.database.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Model failover chain, verified 2026-09-16 with live generate_content probes
+# against this API key: gemini-2.5-flash / gemini-2.5-flash-lite / gemini-2.0-flash /
+# gemini-1.5-flash return 404 (deprecated or unlisted); gemini-3.7-flash and
+# gemini-3.8-flash intermittently return 503 overload. The chain leads with models
+# that succeed. Every entry is a distinct concrete model ID (no "-latest" aliases),
+# and each caller tries a model at most once, so a 429 quota or 404 deprecated
+# error immediately fails over to a genuinely different model.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
+
 class GeminiService:
     """
     Centralized Gemini AI Service for TourFlow AI.
@@ -117,9 +133,9 @@ class GeminiService:
                 "special_requests": string or null
             }}
             """
-            models_to_try = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.7-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            models_to_try = GEMINI_MODEL_FALLBACKS
             text = None
-            used_model = 'gemini-2.5-flash'
+            used_model = GEMINI_MODEL_FALLBACKS[0]
             for m in models_to_try:
                 try:
                     response = self.client.models.generate_content(
@@ -185,7 +201,7 @@ Return this exact object shape:
 {{"destination":"string","destination_summary":"string","recommended_areas":[{{"name":"string","category":"string","area_location":"string|null","description":"string","relevance_to_traveler":"string|null","practical_notes":"string|null"}}],"key_places":[],"attractions":[],"travel_considerations":["string"],"seasonal_considerations":["string"],"preference_relevant_insights":["string"],"source":"gemini"}}
 """
         last_error = None
-        for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+        for model in GEMINI_MODEL_FALLBACKS:
             try:
                 response = self.client.models.generate_content(
                     model=model, contents=prompt,
@@ -225,7 +241,7 @@ Return this exact object shape:
 }}
 """
         last_error = None
-        for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
+        for model in GEMINI_MODEL_FALLBACKS:
             try:
                 response = self.client.models.generate_content(
                     model=model,
@@ -367,7 +383,7 @@ REQUIRED JSON SCHEMA STRUCTURE:
   ]
 }}
 """
-            models_to_try = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.7-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']
+            models_to_try = GEMINI_MODEL_FALLBACKS
             raw_text = None
             for m in models_to_try:
                 try:
@@ -604,7 +620,7 @@ REQUIRED JSON SCHEMA STRUCTURE:
                 "You help travelers design personalized itineraries with precise timings, local hidden gems, "
                 "and proactive contingency plans. Always suggest next actionable travel steps."
             )
-            models_to_try = ['gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite']
+            models_to_try = GEMINI_MODEL_FALLBACKS
             resp_text = None
             for m in models_to_try:
                 try:
