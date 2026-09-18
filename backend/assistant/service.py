@@ -43,6 +43,23 @@ class AssistantService:
         except Exception as exc:
             raise AssistantExecutionError("Assistant response could not be validated") from exc
 
+    def _weather_context(self, trip: Trip) -> Optional[Dict[str, Any]]:
+        """Fetch verified weather for trip destination; None on failure (never fabricated)."""
+        try:
+            from backend.database.config import settings as _settings
+            from backend.weather.service import fetch_weather, WeatherNotConfigured, WeatherProviderError
+            if not _settings.WEATHER_BASE_URL.strip():
+                return None
+            lat = trip.destination.latitude
+            lon = trip.destination.longitude
+            if lat is None or lon is None:
+                return None
+            days = max(1, min(trip.duration_days or 5, 7))
+            data = fetch_weather(float(lat), float(lon), _settings.WEATHER_BASE_URL, _settings.WEATHER_TIMEOUT_S, days=days, api_key=_settings.WEATHER_API_KEY)
+            return {"destination": trip.destination.name, "latitude": float(lat), "longitude": float(lon), "current": data["current"], "forecast": data["forecast"], "source": data["source"], "retrieved_at": data["retrieved_at"]}
+        except Exception:
+            return None
+
     def _validated_context(self, trip: Trip) -> tuple[Dict[str, Any], Dict[str, AssistantReference]]:
         hotels = {item.id: item for item in trip.destination.hotels if item.is_active}
         transports = {item.id: item for item in trip.destination.transport_options if item.is_active}
@@ -99,6 +116,7 @@ class AssistantService:
                    "title": alert.title, "description": alert.description, "is_resolved": alert.is_resolved}
                   for alert in trip.alerts]
         preferences = trip.preferences
+        weather = self._weather_context(trip)
         payload = {
             "trip_id": trip.id, "destination": trip.destination.name, "trip_status": trip.status,
             "start_date": trip.start_date.isoformat() if trip.start_date else None,
@@ -114,6 +132,8 @@ class AssistantService:
                             "dietary_requirements": preferences.dietary_requirements if preferences else [],
                             "special_requests": preferences.special_requests if preferences else None},
             "itinerary": itinerary, "bookings": bookings, "alerts": alerts,
+            "weather": weather,
+            "weather_instruction": "If weather is present, clearly label live weather (current), forecast (future days), and historical/static info. Never invent temperature or conditions; if weather is None, say weather unavailable.",
             "allowed_reference_ids": list(references),
         }
         return payload, references

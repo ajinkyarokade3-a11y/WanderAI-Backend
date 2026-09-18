@@ -13,6 +13,15 @@ The `legacy-node/` directory is reference-only and is not part of normal startup
 - The frontend repositories build and type-check independently.
 - Operator authentication retains the existing behavior but does not yet enforce durable authorization on every backend request.
 
+## Configuration
+
+Server-side keys must stay in `.env` (see `.env.example`):
+
+- `GEMINI_API_KEY` — Google Gemini
+- `SERPAPI_API_KEY` — SerpApi (hotels/restaurants, never exposed to frontend)
+- `WEATHER_BASE_URL` / `WEATHER_API_KEY` — Weather provider (default Open-Meteo `https://api.open-meteo.com/v1/forecast`, no key required; set empty to disable → 503,TTL cache 600s)
+- `DATABASE_URL`, `TRAVELER_JWT_SECRET`, etc.
+
 ## Run
 
 ```text
