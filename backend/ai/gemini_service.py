@@ -550,10 +550,10 @@ REQUIRED JSON SCHEMA STRUCTURE:
             },
             "itinerarySchedule": days_schedule,
             "smartPackingList": [
-                { "id": "p1", "category": "Clothing & Layers", "text": "Comfortable footwear and breathable travel clothing", "checked": true },
-                { "id": "p2", "category": "Essentials & Tech", "text": "Government ID cards (Aadhaar / Passport) & power bank (10,000mAh+)", "checked": true },
-                { "id": "p3", "category": "Health & Wellness", "text": "Personal medical kit (motion sickness, band-aids, basic pain relief)", "checked": true },
-                { "id": "p4", "category": "Accessories", "text": "UV Sunscreen SPF 50+, sunglasses & compact daypack", "checked": false }
+                { "id": "p1", "category": "Clothing & Layers", "text": "Comfortable footwear and breathable travel clothing", "checked": True },
+                { "id": "p2", "category": "Essentials & Tech", "text": "Government ID cards (Aadhaar / Passport) & power bank (10,000mAh+)", "checked": True },
+                { "id": "p3", "category": "Health & Wellness", "text": "Personal medical kit (motion sickness, band-aids, basic pain relief)", "checked": True },
+                { "id": "p4", "category": "Accessories", "text": "UV Sunscreen SPF 50+, sunglasses & compact daypack", "checked": False }
             ],
             "expenseSplitter": [
                 { "id": "e1", "title": f"Transit from {origin} to {destination}", "amount": int(budget * 0.28), "paidBy": "Traveler 1", "category": "transport" },
