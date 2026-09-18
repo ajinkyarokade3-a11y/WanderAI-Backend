@@ -1,7 +1,8 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from backend.database.connection import engine, Base
 from backend.database.config import settings
 from backend.api.routes import router as api_router
@@ -34,9 +35,10 @@ app = FastAPI(
 )
 
 # Enable CORS for Frontend communication
+ALLOWED_ORIGINS = ["*", "http://localhost:3001"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,6 +46,25 @@ app.add_middleware(
 
 # Mount API routes
 app.include_router(api_router, prefix="/api")
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # FastAPI routes Exception/500 handlers to ServerErrorMiddleware, which runs
+    # OUTSIDE CORSMiddleware. Without explicit headers the live server returns a
+    # plain 500 with no Access-Control-Allow-Origin, which browsers report as a
+    # CORS failure (e.g. GET /api/possible-options). Mirror the CORS headers here.
+    logger.exception(f"Unhandled error on {request.url.path}: {exc}")
+    origin = request.headers.get("origin")
+    cors_headers = {}
+    if origin and ("*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS):
+        cors_headers["Access-Control-Allow-Origin"] = origin
+        cors_headers["Access-Control-Allow-Credentials"] = "true"
+        cors_headers["Vary"] = "Origin"
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+        headers=cors_headers,
+    )
 
 @app.get("/")
 def root():
