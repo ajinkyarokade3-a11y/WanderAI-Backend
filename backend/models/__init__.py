@@ -14,6 +14,8 @@ from backend.models.models import (
     Alert,
     ChangeHistory,
     Review,
+    GuideMessage,
+    GuideConversationSummary,
 )
 
 __all__ = [
@@ -32,4 +34,6 @@ __all__ = [
     "Alert",
     "ChangeHistory",
     "Review",
+    "GuideMessage",
+    "GuideConversationSummary",
 ]

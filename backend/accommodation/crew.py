@@ -27,9 +27,12 @@ class AccommodationCrew:
         except ImportError as exc:
             raise RuntimeError("CrewAI is not installed") from exc
 
-        model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-        if model_name in {"gemini-2.5-flash", "gemini/gemini-2.5-flash"}:
-            model_name = "gemini-3.1-flash-lite"
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        if model_name in {"gemini-2.5-flash", "gemini/gemini-2.5-flash",
+                          "gemini-2.5-flash-lite", "gemini-2.0-flash",
+                          "gemini-1.5-flash", "gemini-3.7-flash",
+                          "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"}:
+            model_name = "gemini-3.6-flash"
         if not model_name.startswith("gemini/"):
             model_name = f"gemini/{model_name}"
         llm = LLM(model=model_name, api_key=self.gemini_service.api_key)

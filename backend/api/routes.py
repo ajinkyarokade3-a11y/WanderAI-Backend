@@ -126,8 +126,16 @@ def _resolve_or_discover_destination(db: Session, trip_in: TripCreate) -> Destin
         db.rollback()
         raise HTTPException(status_code=422, detail=f"Destination research could not be verified: {exc}") from exc
     except RuntimeError as exc:
+        # Gemini research failed (dead key, quota, outage): fall back to
+        # live providers (Nominatim geocode + SerpApi hotels + OSM places)
+        # so any real place still builds a trip. Only when that fails too
+        # is the original unavailability reported.
         db.rollback()
-        raise HTTPException(status_code=503, detail=f"Destination research is unavailable: {exc}") from exc
+        from backend.live_fill.service import ensure_live_destination
+        live = ensure_live_destination(db, destination_name)
+        if live is None:
+            raise HTTPException(status_code=503, detail=f"Destination research is unavailable: {exc}") from exc
+        return live
 
 
 def _validate_generation_inventory(db: Session, destination: Destination, currency: str, traveler_count: int, duration_days: int) -> None:
@@ -165,8 +173,9 @@ def _validate_generation_inventory(db: Session, destination: Destination, curren
     missing = []
     if hotel_count == 0:
         missing.append("hotels")
-    if transport_count == 0:
-        missing.append("transport options")
+    # Transport has no live provider and is legitimately traveler-arranged:
+    # its absence no longer blocks creation; the itinerary simply carries
+    # no pre-booked transfer items.
     if activity_count < required_activities:
         missing.append(f"at least {required_activities} distinct activities")
     if missing:
@@ -219,6 +228,20 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                "activity_id": item.activity_id, "transport_id": item.transport_id,
                "location": item.location, "meta_data": item.meta_data or {}}
         row.update((item.meta_data or {}).get("ui", {}))
+        # Image fallback: resolve from the linked catalog row so every
+        # hotel/activity stop renders a photo even when the stored item
+        # predates image metadata (transport has no catalog photos).
+        if not row.get("image_url"):
+            catalog_images = None
+            try:
+                if item.hotel is not None:
+                    catalog_images = item.hotel.images
+                elif item.activity is not None:
+                    catalog_images = item.activity.images
+            except Exception:
+                catalog_images = None
+            if catalog_images:
+                row["image_url"] = catalog_images[0]
         itinerary.append(row)
     bookings = [{"id": b.id, "trip_id": b.trip_id, "vendor_id": b.vendor_id,
                  "booking_reference": b.booking_reference, "item_type": b.item_type, "item_id": b.item_id,
@@ -327,7 +350,7 @@ def health_check(db: Session = Depends(get_db)):
         },
         "ai_engine": {
             "gemini_available": gemini_service.is_available(),
-            "model": "gemini-3.7-flash"
+            "model": "gemini-3.6-flash"
         }
     }
 
@@ -1237,13 +1260,28 @@ def get_transport_options(
 # Trips API (The Central Entity)
 # ----------------------------------------------------
 @router.post("/trips")
-def create_trip(trip_in: TripCreate, db: Session = Depends(get_db)):
+def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get_db)):
     """
     Create a new Trip entity with attached preferences, change history,
     and automatic initial itinerary generation.
+
+    Ownership: a valid traveler session (Bearer JWT) wins over any
+    client-sent user_id so the trip belongs to the logged-in user and the
+    AI Guide can see it. Anonymous creation keeps the legacy fallback.
     """
     # 1. Ensure user exists or use default primary traveler
     user_id = trip_in.user_id
+    try:
+        header = (request.headers.get("authorization") or "") if request else ""
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            from backend.auth.service import parse_traveler_token
+            session_user_id = parse_traveler_token(token.strip())
+            if db.query(User).filter(User.id == session_user_id,
+                                     User.is_active == True).first():  # noqa: E712
+                user_id = session_user_id
+    except Exception:
+        pass
     if not user_id:
         primary_user = db.query(User).first()
         if not primary_user:
@@ -1261,6 +1299,13 @@ def create_trip(trip_in: TripCreate, db: Session = Depends(get_db)):
     # persisted catalog rather than accepting a disconnected frontend object.
     destination = _resolve_or_discover_destination(db, trip_in)
     duration_days = trip_in.duration_days or 4
+    # Dates are the source of truth: a 16-21 Oct range is 6 days even if the
+    # caller sent duration_days=3. Derive it so generation covers the range.
+    if trip_in.start_date and trip_in.end_date:
+        if trip_in.end_date < trip_in.start_date:
+            raise HTTPException(status_code=422, detail="Trip end date is before start date")
+        duration_days = max(
+            1, (trip_in.end_date.date() - trip_in.start_date.date()).days + 1)
     currency = trip_in.currency or "INR"
     traveler_count = trip_in.traveler_count or 2
     try:

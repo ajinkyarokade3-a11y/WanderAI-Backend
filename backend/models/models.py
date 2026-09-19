@@ -510,3 +510,42 @@ class TripMessage(Base):
     is_urgent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# TourFlow AI Guide: persistent traveler-facing conversation memory.
+#
+# Every row is scoped by (user_id, trip_id). All guide queries MUST filter by
+# the authenticated user id and MUST verify trip ownership — never trust a
+# client-provided userId, and never leak one user's conversation to another.
+# ---------------------------------------------------------------------------
+
+class GuideMessage(Base):
+    """One persisted chat turn for the AI Guide (user or assistant)."""
+
+    __tablename__ = "guide_messages"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    trip_id = Column(String(36), ForeignKey("trips.id", ondelete="CASCADE"), nullable=False, index=True)
+    # "user" | "assistant"
+    role = Column(String(20), nullable=False)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class GuideConversationSummary(Base):
+    """Rolling summary per (user, trip) so large histories stay compact.
+
+    recent_messages + conversation_summary + current_trip_context is sent to
+    Gemini instead of the full history forever.
+    """
+
+    __tablename__ = "guide_conversation_summaries"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    trip_id = Column(String(36), ForeignKey("trips.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    summary = Column(Text, nullable=False, default="")
+    message_count = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

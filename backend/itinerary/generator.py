@@ -113,16 +113,15 @@ class ItineraryGenerator:
                 )
 
         transport = None
-        if not preserved_transport_ids:
-            if not transport_options:
-                raise ItineraryGenerationError("No active catalog transport option is available for this destination, currency, and traveler count")
+        if not preserved_transport_ids and transport_options:
+            # Transfers are optional: skip when the destination has no
+            # transport inventory (or none fits the budget) instead of
+            # failing trip generation.
             transport = self._first_within_budget(
                 transport_options,
                 lambda candidate: float(candidate.price or 0),
                 remaining_budget,
             )
-            if not transport:
-                raise ItineraryGenerationError("No active catalog transport option fits the trip budget")
             if transport:
                 remaining_budget = self._subtract_budget(remaining_budget, float(transport.price or 0))
 
@@ -146,13 +145,15 @@ class ItineraryGenerator:
             raise ItineraryGenerationError("Not enough distinct active catalog activities fit the requested duration and budget")
 
         occupied_orders = {(item.day_number, item.order_index) for item in preserved_items}
+        # New stops also occupy orders so same-day items never collide.
+        used_orders = set(occupied_orders)
         new_items: List[ItineraryItem] = []
         if transport:
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=1,
-                    order_index=self._available_order(1, 1, occupied_orders),
+                    order_index=self._available_order(1, 1, used_orders),
                     item_type="transport",
                     title=transport.name,
                     description=self._transport_description(transport),
@@ -171,7 +172,7 @@ class ItineraryGenerator:
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=1,
-                    order_index=self._available_order(1, 2, occupied_orders),
+                    order_index=self._available_order(1, 2, used_orders),
                     item_type="hotel",
                     title=hotel.name,
                     description=hotel.description,
@@ -185,13 +186,18 @@ class ItineraryGenerator:
                 )
             )
 
+        # Proportional distribution: activities spread across the whole
+        # trip, up to 2 per day (morning + afternoon). Thin inventories
+        # yield ~1/day; rich ones fill both daily slots.
+        total_selected = len(selected_activities)
+        day_slot_counts: Dict[int, int] = {}
         for index, activity in enumerate(selected_activities):
             day_number, preferred_order, start_time = self._activity_slot(index, duration_days)
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=day_number,
-                    order_index=self._available_order(day_number, preferred_order, occupied_orders),
+                    order_index=self._available_order(day_number, preferred_order, used_orders),
                     item_type="activity",
                     title=activity.title,
                     description=activity.description,
@@ -257,7 +263,8 @@ class ItineraryGenerator:
                 model.verification_status == "verified_candidate",
             )
         else:
-            query = query.filter(model.inventory_source == "catalog")
+            # Curated catalog plus live-provider rows (SerpApi/OSM fills).
+            query = query.filter(model.inventory_source.in_(["catalog", "live"]))
         if trip.currency:
             query = query.filter(model.currency == trip.currency)
         catalog_by_id = {item.id: item for item in query.all()}
@@ -324,6 +331,7 @@ class ItineraryGenerator:
     @staticmethod
     def _entity_ui_meta(entity: Any) -> Dict[str, Any]:
         meta = {
+            "image_url": (getattr(entity, "images", None) or [None])[0],
             "latitude": getattr(entity, "latitude", None),
             "longitude": getattr(entity, "longitude", None),
             "source_url": getattr(entity, "source_url", None),
