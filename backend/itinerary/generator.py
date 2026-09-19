@@ -395,15 +395,21 @@ class ItineraryGenerator:
         # Round-robin across the whole trip so every sightseeing day receives an
         # activity before any day receives a second one. Sequential 2-per-day
         # packing clustered the minimum required activities on days 1-3 and left
-        # later days empty. Index 0 keeps its historical day-1 evening slot.
+        # later days empty. Index 0 keeps its historical day-1 evening slot;
+        # later day-1 stops go further into the evening so times stay sorted.
         span = max(1, int(duration_days or 1))
         round_number, day_offset = divmod(index, span)
         day_number = day_offset + 1
-        if round_number == 0:
+        if index == 0:
             return day_number, 3, "04:30 PM"
-        if round_number == 1:
+        if day_number == 1:
+            evening = ["06:00 PM", "07:30 PM", "08:30 PM"]
+            return day_number, 4 + round_number, evening[min(round_number - 1, 2)]
+        if round_number == 0:
             return day_number, 1, "09:00 AM"
-        return day_number, 2, "03:00 PM"
+        if round_number == 1:
+            return day_number, 2, "03:00 PM"
+        return day_number, 3 + round_number, "06:00 PM"
 
     @staticmethod
     def _end_time(start_time: str, duration_hours: Any) -> str:

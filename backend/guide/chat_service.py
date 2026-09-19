@@ -549,8 +549,8 @@ class GuideChatService:
                         "If the user requests an itinerary change, describe it in words AND append a JSON block "
                         '{"intent":"UPDATE_ITINERARY","action":"MOVE_ITEM","item_title":"...","new_time":"..."} '
                         "only when a real item matches.")
-            from backend.ai.gemini_service import GEMINI_MODELS
-            models = list(GEMINI_MODELS)
+            from backend.ai.gemini_service import GEMINI_MODEL_FALLBACKS
+            models = list(GEMINI_MODEL_FALLBACKS)
             for m in models:
                 try:
                     resp = self.gemini.client.models.generate_content(model=m, contents=prompt)

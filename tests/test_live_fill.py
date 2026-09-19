@@ -135,20 +135,24 @@ def test_trip_creates_without_transport_when_none_exists(_live_providers):
 
 
 def test_unknown_place_builds_from_live_when_gemini_down(_live_providers, monkeypatch):
-    """Assam replay: Gemini discovery raises, Nominatim + SerpApi/OSM build
-    a real trip anyway. No invented data anywhere."""
+    """Unknown-place replay (Assam scenario): Gemini discovery raises,
+    Nominatim + SerpApi/OSM build a real trip anyway. Uses a unique name so
+    repeated runs never collide with real destinations. No invented data."""
+    import uuid as _uuid
     from backend.dynamic_destination.service import DynamicDestinationDiscoveryService
     import backend.places.service as places_service
+
+    place = f"Ziro Test {_uuid.uuid4().hex[:6]}"
 
     def _gemini_down(*args, **kwargs):
         raise RuntimeError("Gemini destination inventory research failed")
 
     monkeypatch.setattr(DynamicDestinationDiscoveryService, "discover_and_persist", _gemini_down)
     monkeypatch.setattr(places_service, "geocode_place",
-                        lambda name, *a, **k: (27.6, 93.8, f"{name}, Assam, India"))
+                        lambda name, *a, **k: (27.6, 93.8, f"{name}, Arunachal Pradesh, India"))
     r = client.post("/api/trips", json={
-        "title": "Assam Getaway",
-        "destination_name": "Assam",
+        "title": "Unknown Place Getaway",
+        "destination_name": place,
         "duration_days": 5,
         "traveler_count": 4,
         "total_budget": 80000.0,

@@ -1,7 +1,7 @@
 """tourflow ai guide conversation memory
 
-Revision ID: 0009_guide_memory
-Revises: 0008_traveler_auth_ownership
+Revision ID: 0011_guide_memory
+Revises: 0010_notification_indexes
 Create Date: 2026-09-19 00:00:00.000000
 
 """
@@ -11,8 +11,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = "0009_guide_memory"
-down_revision: Union[str, None] = "0008_traveler_auth_ownership"
+revision: str = "0011_guide_memory"
+down_revision: Union[str, None] = "0010_notification_indexes"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

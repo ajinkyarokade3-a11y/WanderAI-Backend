@@ -1311,23 +1311,33 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
     try:
         _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
     except HTTPException as exc:
-        # A catalog row may exist without usable inventory. Fall back to the
-        # verified dynamic-discovery flow instead of stranding the traveler;
-        # complete catalog destinations never reach this branch.
-        if destination.inventory_source != "catalog" or exc.status_code != 422:
+        # Curated catalog has gaps: complete them from configured live
+        # providers (SerpApi hotels, OSM/Wikimedia places) and re-check.
+        # Transport has no live provider and is traveler-arranged, so its
+        # absence no longer blocks creation. Without a SerpApi key, hotels
+        # cannot be filled, so the original error stands as well.
+        if exc.status_code != 422 or not (settings.SERPAPI_API_KEY or "").strip():
             raise
-        fallback_name = _requested_destination_name(trip_in) or destination.name
+        from backend.live_fill.service import fill_destination_inventory
+        filled = fill_destination_inventory(
+            db, destination, currency=currency, traveler_count=traveler_count,
+            duration_days=duration_days,
+            start_date=trip_in.start_date, end_date=trip_in.end_date,
+        )
         try:
-            destination = DynamicDestinationDiscoveryService(db, gemini_service).discover_and_persist(
-                trip_in, fallback_name, secrets.token_hex(16)
-            )
-        except DynamicDestinationDiscoveryError as discovery_exc:
-            db.rollback()
-            raise HTTPException(status_code=422, detail=f"Destination research could not be verified: {discovery_exc}") from discovery_exc
-        except RuntimeError as discovery_exc:
-            db.rollback()
-            raise HTTPException(status_code=503, detail=f"Destination research is unavailable: {discovery_exc}") from discovery_exc
-        _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
+            _validate_generation_inventory(db, destination, currency, traveler_count, duration_days)
+        except HTTPException as retry_exc:
+            hint = ""
+            hotel_error = str(filled.get("hotel_error") or "")
+            if "429" in hotel_error:
+                hint = (" Live hotel search is over its provider quota right now; "
+                        "anything already found is saved, retry after the quota resets.")
+            elif filled.get("hotel_error") or filled.get("activity_error"):
+                hint = " Live providers were temporarily unreachable; retry in a bit."
+            if hint:
+                raise HTTPException(status_code=retry_exc.status_code,
+                                    detail=f"{retry_exc.detail}{hint}")
+            raise
 
     # 3. Create Trip entity
     trip = Trip(
@@ -2595,3 +2605,166 @@ def list_trip_traveler_bookings(trip_id: str, request: Request, db: Session = De
     from backend.booking.traveler_service import list_trip_bookings as svc_trip
     user = get_current_traveler(request, db)
     return svc_trip(db, user.id, trip_id)
+
+# ----------------------------------------------------
+# TourFlow AI Guide - persistent, context-aware chat.
+# Canonical: POST /api/guide/chat {message, tripId?}
+# Alias: POST /api/chat (same payload, frontend compat).
+# History: GET /api/guide/history?tripId=...
+# Greeting: GET /api/guide/greeting?tripId=...
+# Auth: traveler Bearer session; user_id derived server-side only.
+# Isolation: every query scoped by (user_id, trip_id) + ownership check.
+# ----------------------------------------------------
+def _guide_current_user(request: Request, db: Session):
+    from backend.auth.service import get_current_traveler
+    return get_current_traveler(request, db)
+
+
+def _guide_resolve_trip(db: Session, user, trip_id: Optional[str]):
+    """Returns (trip, error_response). Explicit-but-unknown IDs yield a 404
+    that ALSO carries the traveler's own active trip (no leak: own data
+    only) so the UI can self-heal instead of dead-ending."""
+    from fastapi.responses import JSONResponse
+    from backend.guide.context_service import GuideContextService
+    svc = GuideContextService(db)
+    if trip_id:
+        cleaned = str(trip_id).strip()
+        trip = svc.get_owned_trip(user.id, cleaned) if cleaned else None
+        if trip is not None:
+            return trip, None
+        active = svc.get_active_trip(user.id)
+        active_info = None
+        if active is not None:
+            dest = active.destination
+            active_info = {"trip_id": active.id, "title": active.title,
+                           "destination": dest.name if dest else None,
+                           "status": active.status}
+        return None, JSONResponse(
+            status_code=404,
+            content={"detail": "Trip not found",
+                     "active_trip": active_info,
+                     "has_active_trip": active is not None})
+    return svc.get_active_trip(user.id), None
+
+
+def _guide_trip_card(ctx) -> Optional[Dict[str, Any]]:
+    trip = (ctx or {}).get("trip")
+    if not trip:
+        return None
+    budget = (ctx or {}).get("budget") or {}
+    return {"trip_id": trip.get("id"), "title": trip.get("title"),
+            "destination": trip.get("destination"), "status": trip.get("status"),
+            "duration_days": trip.get("duration_days"),
+            "current_trip_day": trip.get("current_trip_day"),
+            "traveler_count": trip.get("traveler_count"),
+            "total_budget": budget.get("total_budget"),
+            "spent": budget.get("current_spend"),
+            "remaining": budget.get("remaining_budget"),
+            "currency": budget.get("currency"),
+            "bookings_count": len((ctx or {}).get("bookings") or [])}
+
+
+def _guide_chat_impl(payload_message: str, payload_trip_id: Optional[str], request: Request, db: Session):
+    from backend.guide.chat_service import GuideChatService
+    user = _guide_current_user(request, db)
+    trip, guide_error = _guide_resolve_trip(db, user, payload_trip_id)
+    if guide_error is not None:
+        return guide_error
+    service = GuideChatService(db, gemini_service)
+    if trip is None:
+        greeting = "I do not see an active trip yet. Create or select a trip and I will help you plan it."
+        return {"response": greeting, "trip_id": None, "greeting": greeting, "action": None,
+                "suggestions": ["Create a trip", "Browse destinations"], "trip_card": None}
+    service.save_message(user.id, trip.id, "user", payload_message)
+    ctx = service.context.buildContext(user.id, trip.id)
+    try:
+        reply = service.generate(payload_message, ctx)
+    except Exception:
+        reply = service.answer_from_context(payload_message, ctx)
+    action_result = None
+    try:
+        parsed = GuideChatService.parse_action(payload_message)
+        if parsed is None and chr(34) + "intent" + chr(34) in (reply or ""):
+            parsed = GuideChatService.parse_action(reply)
+        if parsed is not None:
+            outcome = service.execute_action(user.id, trip, parsed)
+            action_result = {"applied": bool(outcome.get("applied")),
+                             "intent": parsed.get("intent"),
+                             "action": parsed.get("action") or outcome.get("action"),
+                             "item_id": outcome.get("item_id"),
+                             "reason": outcome.get("reason")}
+            if outcome.get("applied"):
+                ctx = service.context.buildContext(user.id, trip.id)
+                reply = (service.describe_action(outcome, parsed)
+                         or service.answer_from_context(payload_message, ctx))
+            elif parsed is not None:
+                reason = outcome.get("reason") or "that did not match anything"
+                reply = (f"I could not apply that change ({reason}). "
+                         f"Tell me the exact stop name as it appears in your itinerary?")
+    except Exception:
+        action_result = None
+    service.save_message(user.id, trip.id, "assistant", reply)
+    try:
+        service.context.maybe_update_summary(user.id, trip.id)
+    except Exception:
+        pass
+    greeting = service.context.build_greeting(ctx)
+    suggestions = ["What should I do tomorrow?", "Show my bookings", "How much have I spent?"]
+    return {"response": reply, "trip_id": trip.id, "greeting": greeting,
+            "action": action_result, "suggestions": suggestions,
+            "trip_card": _guide_trip_card(ctx)}
+
+
+@router.post("/guide/chat")
+def guide_chat(payload: Dict[str, Any] = Body(default={}), request: Request = None, db: Session = Depends(get_db)):
+    from backend.schemas.schemas import GuideChatRequest
+    try:
+        parsed = GuideChatRequest(message=payload.get("message", ""), tripId=payload.get("tripId") or payload.get("trip_id"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _guide_chat_impl(parsed.message, parsed.tripId, request, db)
+
+
+@router.post("/chat")
+def guide_chat_alias(payload: Dict[str, Any] = Body(default={}), request: Request = None, db: Session = Depends(get_db)):
+    from backend.schemas.schemas import GuideChatRequest
+    try:
+        parsed = GuideChatRequest(message=payload.get("message", ""), tripId=payload.get("tripId") or payload.get("trip_id"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _guide_chat_impl(parsed.message, parsed.tripId, request, db)
+
+
+@router.get("/guide/history")
+def guide_history(tripId: Optional[str] = None, trip_id: Optional[str] = None, request: Request = None, db: Session = Depends(get_db)):
+    from backend.guide.chat_service import GuideChatService
+    user = _guide_current_user(request, db)
+    trip, guide_error = _guide_resolve_trip(db, user, tripId or trip_id)
+    if guide_error is not None:
+        return guide_error
+    service = GuideChatService(db, gemini_service)
+    if trip is None:
+        return {"trip_id": None, "greeting": "I do not see an active trip yet. Create or select a trip and I will help you plan it.",
+                "messages": [], "has_active_trip": False, "trip_card": None}
+    ctx = service.context.buildContext(user.id, trip.id)
+    messages = service.load_history(user.id, trip.id, limit=50)
+    return {"trip_id": trip.id, "greeting": service.context.build_greeting(ctx),
+            "messages": messages, "has_active_trip": True,
+            "trip_card": _guide_trip_card(ctx)}
+
+
+@router.get("/guide/greeting")
+def guide_greeting(tripId: Optional[str] = None, trip_id: Optional[str] = None, request: Request = None, db: Session = Depends(get_db)):
+    from backend.guide.chat_service import GuideChatService
+    user = _guide_current_user(request, db)
+    trip, guide_error = _guide_resolve_trip(db, user, tripId or trip_id)
+    if guide_error is not None:
+        return guide_error
+    service = GuideChatService(db, gemini_service)
+    if trip is None:
+        return {"trip_id": None, "greeting": "I do not see an active trip yet. Create or select a trip and I will help you plan it.",
+                "has_active_trip": False, "user_name": user.full_name}
+    ctx = service.context.buildContext(user.id, trip.id)
+    first = (ctx.get("user") or {}).get("first_name")
+    return {"trip_id": trip.id, "greeting": service.context.build_greeting(ctx),
+            "has_active_trip": True, "user_name": first or user.full_name}
