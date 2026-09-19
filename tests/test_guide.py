@@ -67,7 +67,7 @@ def _make_trip(db, user_id, title="Guide Test Trip", dest_slug="manali",
                start_today=True, duration=3, budget=60000.0):
     dest = db.query(Destination).filter(Destination.slug == dest_slug).first()
     assert dest is not None
-    start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) if start_today else None
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) if start_today else None
     end = (start + timedelta(days=duration - 1)) if start else None
     trip = Trip(
         user_id=user_id, destination_id=dest.id, title=title,
@@ -192,6 +192,25 @@ def test_e_trips_have_isolated_conversations(_no_gemini):
     assert all("Alpha-only secret phrase" not in m["message"] for m in hb.json()["messages"])
     ha = client.get("/api/guide/history", params={"tripId": a_id}, headers=_auth(token))
     assert any("Alpha-only secret phrase" in m["message"] for m in ha.json()["messages"])
+
+
+def test_unknown_trip_id_self_heals_with_active_trip(_no_gemini):
+    """Explicit-but-wrong IDs 404 AND carry the user's own active trip
+    (own data only) so the UI can auto-switch instead of dead-ending."""
+    user, token = _signup(name="Self Heal User")
+    trip_id = _manali_trip(user["id"])
+    r = client.get("/api/guide/history", params={"tripId": "does-not-exist"},
+                   headers=_auth(token))
+    assert r.status_code == 404
+    body = r.json()
+    assert body["detail"] == "Trip not found"
+    assert body["has_active_trip"] is True
+    assert body["active_trip"]["trip_id"] == trip_id
+    c = client.post("/api/guide/chat",
+                    json={"message": "hi", "tripId": "does-not-exist"},
+                    headers=_auth(token))
+    assert c.status_code == 404
+    assert c.json()["active_trip"]["trip_id"] == trip_id
 
 
 def test_f_user_cannot_access_another_users_conversation(_no_gemini):
