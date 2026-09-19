@@ -46,12 +46,16 @@ class RecommendationEngine:
                 TransportOption.verification_status == "verified_candidate",
             )
         else:
-            hotels_query = hotels_query.filter(Hotel.inventory_source == "catalog")
-            activities_query = activities_query.filter(Activity.inventory_source == "catalog")
-            transport_query = transport_query.filter(TransportOption.inventory_source == "catalog")
+            # Curated catalog plus live-provider rows (SerpApi/OSM fills).
+            # Discovery sessions stay strictly isolated above.
+            hotels_query = hotels_query.filter(Hotel.inventory_source.in_(["catalog", "live"]))
+            activities_query = activities_query.filter(Activity.inventory_source.in_(["catalog", "live"]))
+            transport_query = transport_query.filter(TransportOption.inventory_source.in_(["catalog", "live"]))
 
         ranked_hotels = self._rank_hotels(hotels_query.all(), preferences)[:5]
-        ranked_activities = self._rank_activities(activities_query.all(), preferences)[:6]
+        # Up to 12 activities so multi-day trips can fill ~2 stops/day;
+        # the generator still caps selection by pace slots and budget.
+        ranked_activities = self._rank_activities(activities_query.all(), preferences)[:12]
         ranked_transport = self._rank_transport(transport_query.all(), preferences)[:4]
         return {
             "ai_insights": self._ai_insights(preferences, destination_id),

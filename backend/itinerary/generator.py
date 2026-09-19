@@ -113,16 +113,15 @@ class ItineraryGenerator:
                 )
 
         transport = None
-        if not preserved_transport_ids:
-            if not transport_options:
-                raise ItineraryGenerationError("No active catalog transport option is available for this destination, currency, and traveler count")
+        if not preserved_transport_ids and transport_options:
+            # Transfers are optional: skip when the destination has no
+            # transport inventory (or none fits the budget) instead of
+            # failing trip generation.
             transport = self._first_within_budget(
                 transport_options,
                 lambda candidate: float(candidate.price or 0),
                 remaining_budget,
             )
-            if not transport:
-                raise ItineraryGenerationError("No active catalog transport option fits the trip budget")
             if transport:
                 remaining_budget = self._subtract_budget(remaining_budget, float(transport.price or 0))
 
@@ -146,13 +145,15 @@ class ItineraryGenerator:
             raise ItineraryGenerationError("Not enough distinct active catalog activities fit the requested duration and budget")
 
         occupied_orders = {(item.day_number, item.order_index) for item in preserved_items}
+        # New stops also occupy orders so same-day items never collide.
+        used_orders = set(occupied_orders)
         new_items: List[ItineraryItem] = []
         if transport:
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=1,
-                    order_index=self._available_order(1, 1, occupied_orders),
+                    order_index=self._available_order(1, 1, used_orders),
                     item_type="transport",
                     title=transport.name,
                     description=self._transport_description(transport),
@@ -171,7 +172,7 @@ class ItineraryGenerator:
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=1,
-                    order_index=self._available_order(1, 2, occupied_orders),
+                    order_index=self._available_order(1, 2, used_orders),
                     item_type="hotel",
                     title=hotel.name,
                     description=hotel.description,
@@ -185,13 +186,35 @@ class ItineraryGenerator:
                 )
             )
 
+        # Proportional distribution: activities spread across the whole
+        # trip, up to 2 per day (morning + afternoon). Thin inventories
+        # yield ~1/day; rich ones fill both daily slots.
+        total_selected = len(selected_activities)
+        day_slot_counts: Dict[int, int] = {}
         for index, activity in enumerate(selected_activities):
-            day_number, preferred_order, start_time = self._activity_slot(index)
+            day_number = self._assigned_day(index, total_selected, duration_days)
+            slot = day_slot_counts.get(day_number, 0)
+            day_slot_counts[day_number] = slot + 1
+            if index == 0:
+                # After day-1 transfer + check-in, the opener is an evening stop.
+                start_time, preferred_order = "04:30 PM", 3
+            elif day_number == 1:
+                # Day 1 is already full: further stops go later in the evening
+                # so times stay sorted within the day.
+                evening = ["06:00 PM", "07:30 PM", "08:30 PM"]
+                start_time = evening[min(slot, 2)]
+                preferred_order = 4 + slot
+            elif slot == 0:
+                start_time, preferred_order = "09:00 AM", 1
+            elif slot == 1:
+                start_time, preferred_order = "03:00 PM", 2
+            else:
+                start_time, preferred_order = "06:00 PM", 3 + slot
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
                     day_number=day_number,
-                    order_index=self._available_order(day_number, preferred_order, occupied_orders),
+                    order_index=self._available_order(day_number, preferred_order, used_orders),
                     item_type="activity",
                     title=activity.title,
                     description=activity.description,
@@ -204,6 +227,25 @@ class ItineraryGenerator:
                     meta_data={"ui": self._entity_ui_meta(activity)},
                 )
             )
+        # Every trip day gets content: days with no stop yet become explicit
+        # flexible leisure time instead of blank days in the itinerary.
+        covered_days = {item.day_number for item in preserved_items}
+        covered_days.update(item.day_number for item in new_items)
+        for day_number in range(1, duration_days + 1):
+            if day_number not in covered_days:
+                new_items.append(
+                    ItineraryItem(
+                        trip_id=trip.id,
+                        day_number=day_number,
+                        order_index=1,
+                        item_type="leisure",
+                        title="Free time for local exploration",
+                        description="Flexible time reserved for traveler-selected activities.",
+                        cost=0,
+                        status="proposed",
+                        location=trip.destination.name if trip.destination else None,
+                    )
+                )
         return new_items
 
     def _trip_items(self, trip: Trip) -> List[ItineraryItem]:
@@ -251,7 +293,8 @@ class ItineraryGenerator:
                 model.verification_status == "verified_candidate",
             )
         else:
-            query = query.filter(model.inventory_source == "catalog")
+            # Curated catalog plus live-provider rows (SerpApi/OSM fills).
+            query = query.filter(model.inventory_source.in_(["catalog", "live"]))
         if trip.currency:
             query = query.filter(model.currency == trip.currency)
         catalog_by_id = {item.id: item for item in query.all()}
@@ -318,6 +361,7 @@ class ItineraryGenerator:
     @staticmethod
     def _entity_ui_meta(entity: Any) -> Dict[str, Any]:
         meta = {
+            "image_url": (getattr(entity, "images", None) or [None])[0],
             "latitude": getattr(entity, "latitude", None),
             "longitude": getattr(entity, "longitude", None),
             "source_url": getattr(entity, "source_url", None),
@@ -326,13 +370,14 @@ class ItineraryGenerator:
         return {key: value for key, value in meta.items() if value not in (None, [], "")}
 
     @staticmethod
-    def _activity_slot(index: int) -> tuple[int, int, str]:
-        if index == 0:
-            return 1, 3, "04:30 PM"
-        day_number = 2 + (index - 1) // 2
-        if index % 2:
-            return day_number, 1, "09:00 AM"
-        return day_number, 2, "03:00 PM"
+    def _assigned_day(index: int, total: int, duration_days: int) -> int:
+        # Proportional spread: activity `index` of `total` lands on the
+        # matching fraction of the trip, so thin inventories (~1/day) and
+        # rich ones (~2/day) both cover the whole range with no blank days
+        # in the middle. Index 0 always opens on day 1.
+        total = max(1, int(total or 1))
+        duration_days = max(1, int(duration_days or 1))
+        return min(duration_days, (index * duration_days) // total + 1)
 
     @staticmethod
     def _end_time(start_time: str, duration_hours: Any) -> str:

@@ -1260,3 +1260,57 @@ class ActivityInventoryRead(BaseModel):
     destination_id: str
     destination_name: Optional[str] = None
     is_active: bool
+
+
+# ---------------------------------------------------------------------------
+# TourFlow AI Guide (persistent, trip-scoped, authenticated).
+# The backend derives user_id from the session - never trust client userId.
+# ---------------------------------------------------------------------------
+
+class GuideChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    tripId: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator('message')
+    @classmethod
+    def message_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError('message must not be blank')
+        return value
+
+
+class GuideChatMessage(BaseModel):
+    role: str
+    message: str
+    created_at: Optional[str] = None
+
+
+class GuideActionResult(BaseModel):
+    applied: bool = False
+    intent: Optional[str] = None
+    action: Optional[str] = None
+    item_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class GuideChatResponse(BaseModel):
+    response: str
+    trip_id: Optional[str] = None
+    greeting: Optional[str] = None
+    action: Optional[GuideActionResult] = None
+    suggestions: List[str] = Field(default_factory=list)
+
+
+class GuideHistoryResponse(BaseModel):
+    trip_id: Optional[str] = None
+    greeting: str
+    messages: List[GuideChatMessage] = Field(default_factory=list)
+    has_active_trip: bool = True
+
+
+class GuideGreetingResponse(BaseModel):
+    trip_id: Optional[str] = None
+    greeting: str
+    has_active_trip: bool = True
+    user_name: Optional[str] = None

@@ -419,8 +419,9 @@ def rank_with_gemini(
             return select_best_candidate(candidates), "serpapi"
         import json as _json
 
+        from backend.ai.gemini_service import GEMINI_MODELS
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODELS[0],
             contents=prompt,
             config={"response_mime_type": "application/json", "temperature": 0.2},
         )
