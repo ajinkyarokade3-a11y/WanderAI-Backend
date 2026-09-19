@@ -18,11 +18,21 @@ most) one provider call per unique location.
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# Bounded retries for fast-fail transient provider responses (rate limits and
+# upstream 5xx). A single throttled SerpApi call must not blank the photo card
+# when the next attempt succeeds. Timeouts and connection errors stay
+# single-shot: retrying a hung 20s call would multiply worst-case latency past
+# frontend tolerance and reintroduce the gateway timeouts this proxy avoids.
+MAX_IMAGE_SEARCH_ATTEMPTS = 3
+_TRANSIENT_IMAGE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class SerpApiImageError(Exception):
@@ -159,13 +169,27 @@ def search_serpapi_images(
         "hl": "en",
         "gl": "in",
     }
-    try:
-        response = _http_get(base_url.rstrip("/") + "/search", params, timeout_s)
-        response.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise SerpApiImageError("Image search timed out") from exc
-    except httpx.HTTPError as exc:
-        raise SerpApiImageError(f"Image search failed: {exc}") from exc
+    response = None
+    for attempt in range(1, MAX_IMAGE_SEARCH_ATTEMPTS + 1):
+        try:
+            response = _http_get(base_url.rstrip("/") + "/search", params, timeout_s)
+            response.raise_for_status()
+            break
+        except httpx.TimeoutException as exc:
+            raise SerpApiImageError("Image search timed out") from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in _TRANSIENT_IMAGE_STATUSES and attempt < MAX_IMAGE_SEARCH_ATTEMPTS:
+                logger.warning(
+                    "Image search transient failure (status %s), retrying %d/%d",
+                    status, attempt, MAX_IMAGE_SEARCH_ATTEMPTS,
+                )
+                time.sleep(0.5 * attempt)
+                continue
+            raise SerpApiImageError(f"Image search failed: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise SerpApiImageError(f"Image search failed: {exc}") from exc
+    assert response is not None  # loop breaks only on success or raise
     try:
         payload = response.json()
     except ValueError as exc:

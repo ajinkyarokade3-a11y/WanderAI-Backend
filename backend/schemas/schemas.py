@@ -3,6 +3,9 @@ from typing import List, Optional, Any, Dict, Literal
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # User & Profile Schemas
+ALLOWED_TRAVEL_STYLES = {"luxury", "budget", "adventure", "cultural", "relaxed", "balanced"}
+ALLOWED_FITNESS_LEVELS = {"low", "moderate", "high"}
+
 class TravelerProfileBase(BaseModel):
     travel_style: Optional[str] = "balanced"
     dietary_preferences: Optional[List[str]] = []
@@ -16,6 +19,149 @@ class TravelerProfileRead(TravelerProfileBase):
     id: str
     user_id: str
     created_at: datetime
+
+# Dedicated traveler profile / preferences schemas for mobile app
+class TravelerPreferencesRead(BaseModel):
+    travel_style: str = "balanced"
+    dietary_preferences: List[str] = Field(default_factory=list)
+    fitness_level: str = "moderate"
+    preferred_currency: str = "INR"
+    language: str = "English"
+
+class TravelerPreferencesUpdate(BaseModel):
+    travel_style: Optional[str] = Field(default=None, max_length=100)
+    dietary_preferences: Optional[List[str]] = None
+    fitness_level: Optional[str] = Field(default=None, max_length=50)
+    preferred_currency: Optional[str] = Field(default=None, max_length=10)
+    language: Optional[str] = Field(default=None, max_length=50)
+
+    @field_validator("travel_style")
+    @classmethod
+    def validate_travel_style(cls, v):
+        if v is None:
+            return v
+        if v not in ALLOWED_TRAVEL_STYLES:
+            raise ValueError(f"travel_style must be one of {sorted(ALLOWED_TRAVEL_STYLES)}")
+        return v
+
+    @field_validator("fitness_level")
+    @classmethod
+    def validate_fitness(cls, v):
+        if v is None:
+            return v
+        if v not in ALLOWED_FITNESS_LEVELS:
+            raise ValueError(f"fitness_level must be one of {sorted(ALLOWED_FITNESS_LEVELS)}")
+        return v
+
+    @field_validator("preferred_currency")
+    @classmethod
+    def validate_currency(cls, v):
+        if v is None:
+            return v
+        import re as _re
+        if not _re.match(r"^[A-Z]{3}$", v):
+            raise ValueError("preferred_currency must be a 3-letter uppercase code (e.g. INR, USD)")
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, v):
+        if v is None:
+            return v
+        cleaned = v.strip()
+        if not cleaned or len(cleaned) < 2 or len(cleaned) > 50:
+            raise ValueError("language must be between 2 and 50 characters")
+        return cleaned
+
+    @field_validator("dietary_preferences")
+    @classmethod
+    def validate_dietary(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("dietary_preferences must be an array")
+        for item in v:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("each dietary preference must be a non-empty string")
+            if len(item) > 50:
+                raise ValueError("each dietary preference must be at most 50 characters")
+        return v
+
+class TravelerProfileResponse(BaseModel):
+    user_id: str
+    full_name: str
+    email: str
+    phone: Optional[str] = None
+    travel_style: str = "balanced"
+    dietary_preferences: List[str] = Field(default_factory=list)
+    fitness_level: str = "moderate"
+    preferred_currency: str = "INR"
+    language: str = "English"
+    bio: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+class TravelerProfileUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    phone: Optional[str] = Field(default=None, max_length=50)
+    travel_style: Optional[str] = Field(default=None, max_length=100)
+    dietary_preferences: Optional[List[str]] = None
+    fitness_level: Optional[str] = Field(default=None, max_length=50)
+    preferred_currency: Optional[str] = Field(default=None, max_length=10)
+    language: Optional[str] = Field(default=None, max_length=50)
+    bio: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("travel_style")
+    @classmethod
+    def validate_travel_style(cls, v):
+        if v is None:
+            return v
+        if v not in ALLOWED_TRAVEL_STYLES:
+            raise ValueError(f"travel_style must be one of {sorted(ALLOWED_TRAVEL_STYLES)}")
+        return v
+
+    @field_validator("fitness_level")
+    @classmethod
+    def validate_fitness(cls, v):
+        if v is None:
+            return v
+        if v not in ALLOWED_FITNESS_LEVELS:
+            raise ValueError(f"fitness_level must be one of {sorted(ALLOWED_FITNESS_LEVELS)}")
+        return v
+
+    @field_validator("preferred_currency")
+    @classmethod
+    def validate_currency(cls, v):
+        if v is None:
+            return v
+        import re as _re
+        if not _re.match(r"^[A-Z]{3}$", v):
+            raise ValueError("preferred_currency must be a 3-letter uppercase code (e.g. INR, USD)")
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, v):
+        if v is None:
+            return v
+        cleaned = v.strip()
+        if not cleaned or len(cleaned) < 2 or len(cleaned) > 50:
+            raise ValueError("language must be between 2 and 50 characters")
+        return cleaned
+
+    @field_validator("dietary_preferences")
+    @classmethod
+    def validate_dietary(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("dietary_preferences must be an array")
+        for item in v:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("each dietary preference must be a non-empty string")
+            if len(item) > 50:
+                raise ValueError("each dietary preference must be at most 50 characters")
+        return v
 
 class UserBase(BaseModel):
     email: str
@@ -364,6 +510,84 @@ class NotificationRead(BaseModel):
     type: str
     is_read: bool
     created_at: datetime
+
+
+# Traveler-facing notification schemas
+class TravelerNotificationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    trip_id: Optional[str] = None
+    title: str
+    message: str
+    type: str
+    is_read: bool
+    created_at: datetime
+
+
+class NotificationListResponse(BaseModel):
+    notifications: List[TravelerNotificationRead]
+    total: int
+    unread_count: int
+    limit: int
+    offset: int
+
+
+class UnreadCountResponse(BaseModel):
+    count: int
+
+
+class MarkAllReadResponse(BaseModel):
+    updated: int
+
+
+# Traveler-facing booking schemas
+class TravelerBookingVendor(BaseModel):
+    id: str
+    name: str
+    vendor_type: str
+    contact_email: Optional[str] = None
+    phone: Optional[str] = None
+    rating: Optional[float] = None
+    is_verified: Optional[bool] = None
+
+
+class TravelerBookingRead(BaseModel):
+    id: str
+    booking_reference: str
+    trip_id: str
+    trip_title: Optional[str] = None
+    destination: Optional[str] = None
+    item_type: str
+    item_id: Optional[str] = None
+    vendor: Optional[TravelerBookingVendor] = None
+    amount: float
+    currency: str
+    status: str
+    payment_status: str
+    booking_date: datetime
+
+
+class TravelerBookingListResponse(BaseModel):
+    bookings: List[TravelerBookingRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class BookingCancelRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class BookingStatusResponse(BaseModel):
+    booking_id: str
+    booking_reference: str
+    status: str
+    payment_status: str
+    item_type: str
+    amount: float
+    currency: str
+    booking_date: datetime
+
 
 class ChangeHistoryRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1262,55 +1486,57 @@ class ActivityInventoryRead(BaseModel):
     is_active: bool
 
 
-# ---------------------------------------------------------------------------
-# TourFlow AI Guide (persistent, trip-scoped, authenticated).
-# The backend derives user_id from the session - never trust client userId.
-# ---------------------------------------------------------------------------
-
-class GuideChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=2000)
-    tripId: Optional[str] = Field(default=None, max_length=64)
-
-    @field_validator('message')
-    @classmethod
-    def message_must_not_be_blank(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError('message must not be blank')
-        return value
+class AddRestaurantRequest(BaseModel):
+    day_number: int = Field(ge=1, description="Day number within trip")
+    name: str = Field(min_length=1, max_length=255)
+    location: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    image_url: Optional[str] = Field(default=None, max_length=1024)
+    rating: Optional[float] = Field(default=None, ge=0, le=5)
+    price_for_two: Optional[Any] = Field(default=None, description="Numeric price or string like '500 for two'")
+    cuisine: Optional[str] = Field(default=None, max_length=255)
+    meal_type: Optional[str] = Field(default=None, max_length=50)
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    source: Optional[str] = Field(default="serpapi", max_length=50)
 
 
-class GuideChatMessage(BaseModel):
-    role: str
-    message: str
-    created_at: Optional[str] = None
+class RestaurantItemRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    trip_id: str
+    day_number: int
+    order_index: int
+    item_type: str
+    title: str
+    description: Optional[str] = None
+    location: Optional[str] = None
+    cost: float
+    status: str
+    meta_data: Optional[Dict[str, Any]] = None
 
 
-class GuideActionResult(BaseModel):
-    applied: bool = False
-    intent: Optional[str] = None
-    action: Optional[str] = None
-    item_id: Optional[str] = None
-    reason: Optional[str] = None
+class WeatherCurrent(BaseModel):
+    temperature: Optional[float] = None
+    feels_like: Optional[float] = None
+    condition: Optional[str] = None
+    humidity: Optional[float] = None
+    wind_speed: Optional[float] = None
 
 
-class GuideChatResponse(BaseModel):
-    response: str
-    trip_id: Optional[str] = None
-    greeting: Optional[str] = None
-    action: Optional[GuideActionResult] = None
-    suggestions: List[str] = Field(default_factory=list)
+class WeatherForecastDay(BaseModel):
+    date: str
+    temperature_min: Optional[float] = None
+    temperature_max: Optional[float] = None
+    condition: Optional[str] = None
+    precipitation_probability: Optional[float] = None
 
 
-class GuideHistoryResponse(BaseModel):
-    trip_id: Optional[str] = None
-    greeting: str
-    messages: List[GuideChatMessage] = Field(default_factory=list)
-    has_active_trip: bool = True
-
-
-class GuideGreetingResponse(BaseModel):
-    trip_id: Optional[str] = None
-    greeting: str
-    has_active_trip: bool = True
-    user_name: Optional[str] = None
+class WeatherResponse(BaseModel):
+    destination: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    current: WeatherCurrent
+    forecast: List[WeatherForecastDay]
+    source: str
+    retrieved_at: str

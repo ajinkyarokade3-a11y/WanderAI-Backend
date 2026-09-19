@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     PLACES_TIMEOUT_S: float = 8.0
     PLACES_RADIUS_M: int = 30000
     PLACES_MAX_RESULTS: int = 12
+    # Weather / live conditions (server-side, never exposed to frontend)
+    WEATHER_BASE_URL: str = "https://api.open-meteo.com/v1/forecast"
+    WEATHER_API_KEY: str = ""
+    WEATHER_TIMEOUT_S: float = 8.0
+    WEATHER_CACHE_TTL_S: int = 600
+    WEATHER_DAYS_DEFAULT: int = 5
     # Traveler password login (JWT). Override TRAVELER_JWT_SECRET in production;
     # the built-in default is development-only.
     TRAVELER_JWT_SECRET: str = "dev-only-traveler-jwt-secret-change-in-production"

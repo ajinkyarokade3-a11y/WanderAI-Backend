@@ -192,24 +192,7 @@ class ItineraryGenerator:
         total_selected = len(selected_activities)
         day_slot_counts: Dict[int, int] = {}
         for index, activity in enumerate(selected_activities):
-            day_number = self._assigned_day(index, total_selected, duration_days)
-            slot = day_slot_counts.get(day_number, 0)
-            day_slot_counts[day_number] = slot + 1
-            if index == 0:
-                # After day-1 transfer + check-in, the opener is an evening stop.
-                start_time, preferred_order = "04:30 PM", 3
-            elif day_number == 1:
-                # Day 1 is already full: further stops go later in the evening
-                # so times stay sorted within the day.
-                evening = ["06:00 PM", "07:30 PM", "08:30 PM"]
-                start_time = evening[min(slot, 2)]
-                preferred_order = 4 + slot
-            elif slot == 0:
-                start_time, preferred_order = "09:00 AM", 1
-            elif slot == 1:
-                start_time, preferred_order = "03:00 PM", 2
-            else:
-                start_time, preferred_order = "06:00 PM", 3 + slot
+            day_number, preferred_order, start_time = self._activity_slot(index, duration_days)
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
@@ -227,25 +210,12 @@ class ItineraryGenerator:
                     meta_data={"ui": self._entity_ui_meta(activity)},
                 )
             )
-        # Every trip day gets content: days with no stop yet become explicit
-        # flexible leisure time instead of blank days in the itinerary.
-        covered_days = {item.day_number for item in preserved_items}
-        covered_days.update(item.day_number for item in new_items)
-        for day_number in range(1, duration_days + 1):
-            if day_number not in covered_days:
-                new_items.append(
-                    ItineraryItem(
-                        trip_id=trip.id,
-                        day_number=day_number,
-                        order_index=1,
-                        item_type="leisure",
-                        title="Free time for local exploration",
-                        description="Flexible time reserved for traveler-selected activities.",
-                        cost=0,
-                        status="proposed",
-                        location=trip.destination.name if trip.destination else None,
-                    )
-                )
+        departure_note = self._departure_note(trip, preserved_items, new_items, hotel, transport)
+        if departure_note is not None:
+            departure_note.order_index = self._available_order(
+                departure_note.day_number, departure_note.order_index, occupied_orders
+            )
+            new_items.append(departure_note)
         return new_items
 
     def _trip_items(self, trip: Trip) -> List[ItineraryItem]:
@@ -369,15 +339,71 @@ class ItineraryGenerator:
         }
         return {key: value for key, value in meta.items() if value not in (None, [], "")}
 
+    def _departure_note(
+        self,
+        trip: Trip,
+        preserved_items: Sequence[ItineraryItem],
+        new_items: Sequence[ItineraryItem],
+        hotel: Any,
+        transport: Any,
+    ) -> Optional[ItineraryItem]:
+        """Append a derived check-out/departure note when the last day is empty.
+
+        Content references only persisted trip facts (stay/transfer names);
+        never inventory. Returns None when the last day already has items.
+        """
+        duration_days = self._duration_days(trip)
+        if duration_days < 2:
+            return None
+        if any(item.day_number == duration_days for item in preserved_items):
+            return None
+        if any(item.day_number == duration_days for item in new_items):
+            return None
+        stay_name = hotel.name if hotel is not None else next(
+            (item.title for item in preserved_items if item.item_type == "hotel"), None
+        )
+        ride_name = transport.name if transport is not None else next(
+            (item.title for item in preserved_items if item.item_type == "transport"), None
+        )
+        details = []
+        if stay_name:
+            details.append(f"check out from {stay_name}")
+        if ride_name:
+            details.append(f"return transfer via {ride_name}")
+        dest_name = trip.destination.name if trip.destination else "destination"
+        description = (
+            ("; ".join(details) + f"; homeward departure from {dest_name}.")
+            if details else f"Leisure morning and homeward departure from {dest_name}."
+        )
+        return ItineraryItem(
+            trip_id=trip.id,
+            day_number=duration_days,
+            order_index=1,
+            item_type="note",
+            title=f"Check-out & homeward departure ({dest_name})",
+            description=description,
+            start_time="10:00 AM",
+            end_time="12:00 PM",
+            cost=0.0,
+            status="proposed",
+            location=dest_name,
+            meta_data={"ui": {}},
+        )
+
     @staticmethod
-    def _assigned_day(index: int, total: int, duration_days: int) -> int:
-        # Proportional spread: activity `index` of `total` lands on the
-        # matching fraction of the trip, so thin inventories (~1/day) and
-        # rich ones (~2/day) both cover the whole range with no blank days
-        # in the middle. Index 0 always opens on day 1.
-        total = max(1, int(total or 1))
-        duration_days = max(1, int(duration_days or 1))
-        return min(duration_days, (index * duration_days) // total + 1)
+    def _activity_slot(index: int, duration_days: int) -> tuple[int, int, str]:
+        # Round-robin across the whole trip so every sightseeing day receives an
+        # activity before any day receives a second one. Sequential 2-per-day
+        # packing clustered the minimum required activities on days 1-3 and left
+        # later days empty. Index 0 keeps its historical day-1 evening slot.
+        span = max(1, int(duration_days or 1))
+        round_number, day_offset = divmod(index, span)
+        day_number = day_offset + 1
+        if round_number == 0:
+            return day_number, 3, "04:30 PM"
+        if round_number == 1:
+            return day_number, 1, "09:00 AM"
+        return day_number, 2, "03:00 PM"
 
     @staticmethod
     def _end_time(start_time: str, duration_hours: Any) -> str:

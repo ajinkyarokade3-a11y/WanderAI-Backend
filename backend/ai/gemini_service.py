@@ -6,9 +6,21 @@ from backend.database.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Canonical live model cascade (Google retired the 1.x/2.x/3.1/3.7 names;
-# they now 404. Keep this list current; every caller below uses it.)
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+# Model failover chain, verified 2026-09-16 with live generate_content probes
+# against this API key: gemini-2.5-flash / gemini-2.5-flash-lite / gemini-2.0-flash /
+# gemini-1.5-flash return 404 (deprecated or unlisted); gemini-3.7-flash and
+# gemini-3.8-flash intermittently return 503 overload. The chain leads with models
+# that succeed. Every entry is a distinct concrete model ID (no "-latest" aliases),
+# and each caller tries a model at most once, so a 429 quota or 404 deprecated
+# error immediately fails over to a genuinely different model.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
 
 class GeminiService:
     """
@@ -121,9 +133,9 @@ class GeminiService:
                 "special_requests": string or null
             }}
             """
-            models_to_try = list(GEMINI_MODELS)
+            models_to_try = GEMINI_MODEL_FALLBACKS
             text = None
-            used_model = GEMINI_MODELS[0]
+            used_model = GEMINI_MODEL_FALLBACKS[0]
             for m in models_to_try:
                 try:
                     response = self.client.models.generate_content(
@@ -189,7 +201,7 @@ Return this exact object shape:
 {{"destination":"string","destination_summary":"string","recommended_areas":[{{"name":"string","category":"string","area_location":"string|null","description":"string","relevance_to_traveler":"string|null","practical_notes":"string|null"}}],"key_places":[],"attractions":[],"travel_considerations":["string"],"seasonal_considerations":["string"],"preference_relevant_insights":["string"],"source":"gemini"}}
 """
         last_error = None
-        for model in GEMINI_MODELS:
+        for model in GEMINI_MODEL_FALLBACKS:
             try:
                 response = self.client.models.generate_content(
                     model=model, contents=prompt,
@@ -229,7 +241,7 @@ Return this exact object shape:
 }}
 """
         last_error = None
-        for model in GEMINI_MODELS:
+        for model in GEMINI_MODEL_FALLBACKS:
             try:
                 response = self.client.models.generate_content(
                     model=model,
@@ -371,7 +383,7 @@ REQUIRED JSON SCHEMA STRUCTURE:
   ]
 }}
 """
-            models_to_try = list(GEMINI_MODELS)
+            models_to_try = GEMINI_MODEL_FALLBACKS
             raw_text = None
             for m in models_to_try:
                 try:
@@ -554,10 +566,10 @@ REQUIRED JSON SCHEMA STRUCTURE:
             },
             "itinerarySchedule": days_schedule,
             "smartPackingList": [
-                { "id": "p1", "category": "Clothing & Layers", "text": "Comfortable footwear and breathable travel clothing", "checked": true },
-                { "id": "p2", "category": "Essentials & Tech", "text": "Government ID cards (Aadhaar / Passport) & power bank (10,000mAh+)", "checked": true },
-                { "id": "p3", "category": "Health & Wellness", "text": "Personal medical kit (motion sickness, band-aids, basic pain relief)", "checked": true },
-                { "id": "p4", "category": "Accessories", "text": "UV Sunscreen SPF 50+, sunglasses & compact daypack", "checked": false }
+                { "id": "p1", "category": "Clothing & Layers", "text": "Comfortable footwear and breathable travel clothing", "checked": True },
+                { "id": "p2", "category": "Essentials & Tech", "text": "Government ID cards (Aadhaar / Passport) & power bank (10,000mAh+)", "checked": True },
+                { "id": "p3", "category": "Health & Wellness", "text": "Personal medical kit (motion sickness, band-aids, basic pain relief)", "checked": True },
+                { "id": "p4", "category": "Accessories", "text": "UV Sunscreen SPF 50+, sunglasses & compact daypack", "checked": False }
             ],
             "expenseSplitter": [
                 { "id": "e1", "title": f"Transit from {origin} to {destination}", "amount": int(budget * 0.28), "paidBy": "Traveler 1", "category": "transport" },
@@ -608,7 +620,7 @@ REQUIRED JSON SCHEMA STRUCTURE:
                 "You help travelers design personalized itineraries with precise timings, local hidden gems, "
                 "and proactive contingency plans. Always suggest next actionable travel steps."
             )
-            models_to_try = list(GEMINI_MODELS)
+            models_to_try = GEMINI_MODEL_FALLBACKS
             resp_text = None
             for m in models_to_try:
                 try:
