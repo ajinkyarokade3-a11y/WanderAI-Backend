@@ -45,58 +45,114 @@ class GeminiService:
     def is_available(self) -> bool:
         return bool(self.api_key)
 
+    @staticmethod
+    def _heuristic_preferences(text_prompt: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Rule-based extractor: real values parsed from the text, nulls elsewhere.
+
+        Used when Gemini is unconfigured AND when Gemini calls fail, so a
+        blocked key never yields emptier results than no key at all.
+        """
+        import re
+        prompt_lower = (text_prompt or "").lower()
+        detected_interests = []
+        for kw in ["snow", "mountains", "trekking", "adventure", "cafes", "culture",
+                   "beaches", "relax", "food", "luxury", "budget", "heritage", "palace",
+                   "fort", "lake", "seafood", "shopping", "nightlife", "wildlife",
+                   "desert", "backwater", "tea", "temple", "cruise", "sunset", "yoga",
+                   "honeymoon", "houseboat", "photography", "spa"]:
+            if kw in prompt_lower:
+                detected_interests.append(kw)
+
+        budget = None
+        if "luxury" in prompt_lower or "5 star" in prompt_lower or "5-star" in prompt_lower:
+            budget = "luxury"
+        elif "budget" in prompt_lower or "backpack" in prompt_lower or "cheap" in prompt_lower:
+            budget = "budget"
+        elif "moderate" in prompt_lower or "mid-range" in prompt_lower:
+            budget = "moderate"
+
+        budget_amount = None
+        budget_currency = None
+        amt_match = re.search(r"(?:under|around|about|below|budget(?:\s+of)?|rs\.?|₹|inr|\$|usd)?\s*₹?\s*([\d,]{4,7})", prompt_lower)
+        if amt_match:
+            try:
+                budget_amount = int(amt_match.group(1).replace(",", ""))
+            except (TypeError, ValueError):
+                budget_amount = None
+        if budget_amount is not None:
+            if "$" in prompt_lower or "usd" in prompt_lower:
+                budget_currency = "USD"
+            else:
+                budget_currency = "INR"
+            if budget is None:
+                budget = "budget" if budget_amount < 30000 else ("moderate" if budget_amount < 100000 else "luxury")
+
+        companions = None
+        if "solo" in prompt_lower or "alone" in prompt_lower or "myself" in prompt_lower:
+            companions = "solo"
+        elif "couple" in prompt_lower or "honeymoon" in prompt_lower or "partner" in prompt_lower or "wife" in prompt_lower or "husband" in prompt_lower:
+            companions = "couple"
+        elif "family" in prompt_lower or "kids" in prompt_lower or "parents" in prompt_lower:
+            companions = "family"
+        elif "friends" in prompt_lower or "buddies" in prompt_lower or "gang" in prompt_lower:
+            companions = "friends"
+
+        traveler_count = None
+        count_match = re.search(r"(\d+)\s*(?:people|persons|travellers|travelers|traveller|traveler|adults|person)\b", prompt_lower)
+        if count_match:
+            try:
+                traveler_count = max(1, int(count_match.group(1)))
+            except (TypeError, ValueError):
+                traveler_count = None
+        if traveler_count == 1 and companions is None:
+            companions = "solo"
+
+        dest = None
+        known = ((context or {}).get("known_destinations")
+                 or ["Darjeeling", "Manali", "Goa", "Kerala", "Kashmir", "Ladakh",
+                     "Rajasthan", "Shimla", "Ooty", "Rishikesh", "Varanasi", "Andaman",
+                     "Sikkim", "Coorg", "Udaipur", "Assam", "Kolkata", "Jaipur",
+                     "Agra", "Mysore", "Pondicherry", "Hampi"])
+        for d in known:
+            if str(d).lower() in prompt_lower:
+                dest = str(d)
+                break
+
+        dur = None
+        dur_match = re.search(r"(\d+)\s*-?\s*(?:day|days)", prompt_lower)
+        if dur_match:
+            dur = int(dur_match.group(1))
+
+        pace = None
+        if any(k in prompt_lower for k in ["slow", "relaxed", "leisurely", "easy pace", "chill"]):
+            pace = "relaxed"
+        elif any(k in prompt_lower for k in ["packed", "fast-paced", "cover maximum", "cover max", "hectic"]):
+            pace = "packed"
+        elif any(k in prompt_lower for k in ["balanced", "moderate pace"]):
+            pace = "balanced"
+
+        return {
+            "detected_destination": dest,
+            "budget_tier": budget,
+            "budget_amount": budget_amount,
+            "budget_currency": budget_currency,
+            "interests": detected_interests or [],
+            "travel_companions": companions,
+            "traveler_count": traveler_count,
+            "duration_days": dur,
+            "pace": pace,
+            "special_requests": text_prompt,
+        }
+
     def extract_preferences(self, text_prompt: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Extract structured travel preferences from conversational text or user prompt.
         Strict parameter extraction with ZERO default fallbacks or placeholder leakage.
         """
         if not self.is_available() or not self.client:
-            # High-quality fallback rule-based / heuristic extractor
-            prompt_lower = text_prompt.lower()
-            detected_interests = []
-            for kw in ["snow", "mountains", "trekking", "adventure", "cafes", "culture", "beaches", "relax", "food", "luxury", "budget"]:
-                if kw in prompt_lower:
-                    detected_interests.append(kw)
-            
-            budget = None
-            if "luxury" in prompt_lower or "5 star" in prompt_lower or "5-star" in prompt_lower:
-                budget = "luxury"
-            elif "budget" in prompt_lower or "backpack" in prompt_lower or "cheap" in prompt_lower:
-                budget = "budget"
-            elif "moderate" in prompt_lower or "mid-range" in prompt_lower:
-                budget = "moderate"
-
-            companions = None
-            if "solo" in prompt_lower or "alone" in prompt_lower or "myself" in prompt_lower:
-                companions = "solo"
-            elif "couple" in prompt_lower or "honeymoon" in prompt_lower or "partner" in prompt_lower or "wife" in prompt_lower or "husband" in prompt_lower:
-                companions = "couple"
-            elif "family" in prompt_lower or "kids" in prompt_lower or "parents" in prompt_lower:
-                companions = "family"
-            elif "friends" in prompt_lower or "buddies" in prompt_lower or "gang" in prompt_lower:
-                companions = "friends"
-
-            dest = None
-            for d in ["Darjeeling", "Manali", "Goa", "Kerala", "Kashmir", "Ladakh", "Rajasthan", "Shimla", "Ooty", "Rishikesh", "Varanasi", "Andaman", "Sikkim", "Coorg"]:
-                if d.lower() in prompt_lower:
-                    dest = d
-                    break
-
-            dur = None
-            import re
-            dur_match = re.search(r'(\d+)\s*(?:day|days)', prompt_lower)
-            if dur_match:
-                dur = int(dur_match.group(1))
-            
-            return {
-                "detected_destination": dest,
-                "budget_tier": budget,
-                "interests": detected_interests or [],
-                "travel_companions": companions,
-                "duration_days": dur,
-                "special_requests": text_prompt,
-                "source": "fallback_extractor"
-            }
+            result = self._heuristic_preferences(text_prompt, context)
+            result["source"] = "fallback_extractor"
+            return result
 
         try:
             prompt = f"""
@@ -161,16 +217,12 @@ class GeminiService:
             return data
         except Exception as e:
             logger.error(f"Gemini preference extraction error: {e}")
-            return {
-                "detected_destination": None,
-                "budget_tier": None,
-                "interests": [],
-                "travel_companions": None,
-                "duration_days": None,
-                "pace": None,
-                "error": str(e),
-                "source": "fallback_on_error"
-            }
+            # Blocked key must not yield emptier results than no key: reuse
+            # the heuristic extractor and report the provider error alongside.
+            result = self._heuristic_preferences(text_prompt, context)
+            result["error"] = str(e)[:200]
+            result["source"] = "fallback_on_error"
+            return result
 
     def recommend(self, preferences: Dict[str, Any], destination_id: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
         """

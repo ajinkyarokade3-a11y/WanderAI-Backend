@@ -255,6 +255,8 @@ def _fill_activities(db: Session, destination: Destination, existing: set,
         max(int(needed or 0), 8), settings.NOMINATIM_API_URL, settings.OVERPASS_API_URL,
         settings.COMMONS_API_URL, settings.PLACES_TIMEOUT_S, settings.PLACES_RADIUS_M,
     )
+    if not (result or {}).get("places"):
+        raise RuntimeError("live places provider returned no attractions (possibly throttled)")
     added = 0
     for place in (result or {}).get("places") or []:
         name = str((place or {}).get("name") or "").strip()

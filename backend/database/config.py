@@ -29,7 +29,9 @@ class Settings(BaseSettings):
     NOMINATIM_API_URL: str = "https://nominatim.openstreetmap.org"
     OVERPASS_API_URL: str = "https://overpass-api.de/api/interpreter"
     COMMONS_API_URL: str = "https://commons.wikimedia.org/w/api.php"
-    PLACES_TIMEOUT_S: float = 8.0
+    # Overpass city queries routinely need >8s; the pipeline retries tight
+    # on empty wide queries, so metros answer instead of timing out blank.
+    PLACES_TIMEOUT_S: float = 25.0
     PLACES_RADIUS_M: int = 30000
     PLACES_MAX_RESULTS: int = 12
     # Weather / live conditions (server-side, never exposed to frontend)

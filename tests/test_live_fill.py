@@ -244,6 +244,50 @@ def test_quota_exhaustion_hint(_live_providers, monkeypatch):
         _delete_destination(dest_id)
 
 
+def test_places_retry_tight_radius(monkeypatch):
+    """Wide-query timeout (empty) retries once tight and recovers."""
+    import backend.places.service as places_service
+
+    calls = []
+
+    def _flaky(lat, lng, url, timeout_s, radius_m, limit):
+        calls.append(radius_m)
+        if len(calls) == 1:
+            return []
+        return [{"name": "Tight Spot", "latitude": lat, "longitude": lng, "kind": "viewpoint"}]
+
+    monkeypatch.setattr(places_service, "fetch_attractions", _flaky)
+    monkeypatch.setattr(places_service, "fetch_place_images", lambda *a, **k: [])
+    out = places_service.get_live_places("Delhi", 28.6, 77.2, 5,
+                                         "http://x", "http://x", "http://x", 25, 30000)
+    assert [p["name"] for p in out["places"]] == ["Tight Spot"]
+    assert calls == [30000, 10000]
+
+
+def test_empty_places_signals_provider_issue(monkeypatch):
+    """Zero attractions everywhere surfaces as a fill error (drives hint)."""
+    import backend.places.service as places_service
+    from backend.database.config import settings
+    from backend.live_fill.service import fill_destination_inventory
+
+    monkeypatch.setattr(places_service, "fetch_attractions", lambda *a, **k: [])
+    monkeypatch.setattr(settings, "SERPAPI_API_KEY", "")
+    dest_id = _make_bare_destination(with_transport=True)
+    try:
+        db = SessionLocal()
+        try:
+            from backend.models.models import Destination
+            dest = db.query(Destination).filter(Destination.id == dest_id).one()
+            out = fill_destination_inventory(
+                db, dest, currency="INR", traveler_count=2, duration_days=3)
+            assert out["activities"] == 0
+            assert out["activity_error"] is not None
+        finally:
+            db.close()
+    finally:
+        _delete_destination(dest_id)
+
+
 def test_fill_is_idempotent(_live_providers):
     from backend.live_fill.service import fill_destination_inventory
     dest_id = _make_bare_destination(with_transport=True)

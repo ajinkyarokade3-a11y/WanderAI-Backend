@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from sqlalchemy import (
-    Column, String, Text, Integer, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum, JSON
+    Column, String, Text, Integer, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum, JSON, LargeBinary
 )
 from sqlalchemy.orm import relationship
 from backend.database.connection import Base
@@ -21,6 +21,11 @@ class User(Base):
     # bcrypt hash for traveler password login. Null for legacy/seeded rows
     # and operator accounts authenticated by other means.
     password_hash = Column(String(255), nullable=True)
+    # Profile photo bytes (set via POST /api/traveler/avatar). Null means
+    # the UI falls back to the name initial. Stored in-DB so avatars survive
+    # redeploys; capped at 5 MB on upload.
+    avatar_image = Column(LargeBinary, nullable=True)
+    avatar_mime = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

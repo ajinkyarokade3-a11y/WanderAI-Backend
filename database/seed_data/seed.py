@@ -620,6 +620,58 @@ def _all_catalog_builders():
             _rajasthan_catalog_rows, _udaipur_catalog_rows]
 
 
+# Real coordinates for original catalog rows that shipped without them
+# (needed so every itinerary stop plots on the trip map). Only fills
+# blanks — never overwrites existing values.
+_CATALOG_COORDINATES = {
+    ("Hotel", "htl-manali-001"): (32.2390, 77.1910),
+    ("Hotel", "htl-manali-002"): (32.2205, 77.1895),
+    ("Hotel", "htl-manali-003"): (32.1820, 77.1980),
+    ("Hotel", "htl-manali-004"): (32.2458, 77.1805),
+    ("Hotel", "htl-goa-001"): (15.2589, 73.9235),
+    ("Activity", "act-manali-001"): (32.0283, 77.1667),
+    ("Activity", "act-manali-002"): (32.3710, 77.2400),
+    ("Activity", "act-manali-003"): (32.2589, 77.1720),
+    ("Activity", "act-manali-004"): (32.2458, 77.1805),
+    ("Activity", "act-manali-005"): (32.1030, 77.1470),
+    ("TransportOption", "trn-manali-001"): (32.2396, 77.1887),
+    ("TransportOption", "trn-manali-002"): (32.2396, 77.1887),
+    ("TransportOption", "trn-manali-003"): (32.2396, 77.1887),
+    # Transport rows are routes: anchor at the destination town so trip
+    # maps can draw them. One entry per seeded transport row.
+    ("TransportOption", "trn-goa-001"): (15.4909, 73.8278),
+    ("TransportOption", "trn-goa-002"): (15.4909, 73.8278),
+    ("TransportOption", "trn-goa-003"): (15.4909, 73.8278),
+    ("TransportOption", "trn-kas-001"): (34.0837, 74.7973),
+    ("TransportOption", "trn-kas-002"): (34.0837, 74.7973),
+    ("TransportOption", "trn-kas-003"): (34.0837, 74.7973),
+    ("TransportOption", "trn-ker-001"): (9.9312, 76.2673),
+    ("TransportOption", "trn-ker-002"): (9.9312, 76.2673),
+    ("TransportOption", "trn-ker-003"): (9.9312, 76.2673),
+    ("TransportOption", "trn-raj-001"): (26.9124, 75.7873),
+    ("TransportOption", "trn-raj-002"): (26.9124, 75.7873),
+    ("TransportOption", "trn-raj-003"): (26.9124, 75.7873),
+    ("TransportOption", "trn-uda-001"): (24.5854, 73.7125),
+    ("TransportOption", "trn-uda-002"): (24.5854, 73.7125),
+    ("TransportOption", "trn-uda-003"): (24.5854, 73.7125),
+}
+
+
+def ensure_catalog_coordinates(db) -> int:
+    """Fill blank lat/long on catalog rows. Idempotent; returns count fixed."""
+    from backend.models.models import Activity, Hotel, TransportOption
+    models = {"Hotel": Hotel, "Activity": Activity, "TransportOption": TransportOption}
+    fixed = 0
+    for (model_name, row_id), (lat, lng) in _CATALOG_COORDINATES.items():
+        row = db.query(models[model_name]).filter(models[model_name].id == row_id).first()
+        if row is not None and (row.latitude is None or row.longitude is None):
+            row.latitude, row.longitude = lat, lng
+            fixed += 1
+    if fixed:
+        logger.info(f"Catalog coordinates: filled {fixed} blank rows.")
+    return fixed
+
+
 def ensure_catalog_backfill(db: Session) -> None:
     """Idempotent backfill: insert catalog rows missing from older databases.
 
@@ -649,6 +701,7 @@ def run_seed():
         if db.query(Destination).filter(Destination.slug == "manali").first():
             logger.info("Database already seeded with foundation data.")
             ensure_catalog_backfill(db)
+            ensure_catalog_coordinates(db)
             db.commit()
             return
 
@@ -1036,6 +1089,7 @@ def run_seed():
             for _model, _rows in _builder().items():
                 db.add_all(_rows)
         db.flush()
+        ensure_catalog_coordinates(db)
 
         # ----------------------------------------------------
         # 7. Central Entity Demo: Seed Trip with Complete Sub-Entities

@@ -92,6 +92,7 @@ class TravelerProfileResponse(BaseModel):
     full_name: str
     email: str
     phone: Optional[str] = None
+    has_avatar: bool = False
     travel_style: str = "balanced"
     dietary_preferences: List[str] = Field(default_factory=list)
     fitness_level: str = "moderate"
@@ -779,7 +780,9 @@ class AIChatResponse(BaseModel):
     extracted_preferences: Optional[Dict[str, Any]] = None
 
 class AIExtractPreferencesRequest(BaseModel):
-    text_prompt: str
+    text_prompt: Optional[str] = None
+    # Alias accepted for voice clients that POST {text}: either key works.
+    text: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
 
 class AIRecommendRequest(BaseModel):

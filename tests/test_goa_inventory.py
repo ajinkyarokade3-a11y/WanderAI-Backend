@@ -161,6 +161,31 @@ def test_rich_trips_fill_two_stops_per_day():
     assert client.delete(f"/api/trips/{r.json()['id']}").status_code == 200
 
 
+def test_generation_stays_within_budget():
+    """The reported blowout: 50k/3 travelers/5 days planned 76,950.
+    Hotel must leave room for transfers + required activities, and forced
+    minimum picks must be the cheapest ones."""
+    manali_id = client.get("/api/destinations/manali").json()["id"]
+    r = client.post("/api/trips", json={
+        "title": "Budget Honesty Check",
+        "destination_id": manali_id,
+        "duration_days": 5,
+        "traveler_count": 3,
+        "total_budget": 50000.0,
+        "currency": "INR",
+        "pace": "balanced",
+    })
+    assert r.status_code == 200, r.text
+    items = r.json()["itinerary"]
+    total = sum(float(i.get("cost") or 0) for i in items)
+    assert total <= 50000.0, f"planned {total} over 50000 budget"
+    by_day = {}
+    for item in items:
+        by_day.setdefault(item["day_number"], []).append(item)
+    assert sorted(by_day) == [1, 2, 3, 4, 5]
+    assert client.delete(f"/api/trips/{r.json()['id']}").status_code == 200
+
+
 def test_legacy_items_resolve_images_from_catalog():
     """Trips generated before image metadata existed still render photos
     via the catalog fallback in the trip serializer."""
