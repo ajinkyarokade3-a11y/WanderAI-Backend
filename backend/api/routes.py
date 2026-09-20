@@ -1422,6 +1422,72 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Trip not found")
     return _trip_dict(trip, db)
 
+@router.get("/trips/{trip_id}/map")
+def trip_map(trip_id: str, db: Session = Depends(get_db)):
+    """Map-ready itinerary: days with plotted stops (real coordinates only).
+
+    Coordinates resolve per stop from stored item metadata, falling back to
+    the linked catalog hotel/activity/transport row. Stops without any
+    coordinates are returned with has_coordinates=false (honest gaps for
+    custom stops) and counted in unmapped_count. Center is the mean of
+    plotted stops, else the destination point.
+    """
+    trip = _trip_or_404(db, trip_id)
+
+    def _coords(item) -> tuple:
+        ui = (item.meta_data or {}).get("ui", {}) or {}
+        lat, lng = ui.get("latitude"), ui.get("longitude")
+        try:
+            if item.hotel is not None and (lat is None or lng is None):
+                lat, lng = item.hotel.latitude, item.hotel.longitude
+            elif item.activity is not None and (lat is None or lng is None):
+                lat, lng = item.activity.latitude, item.activity.longitude
+            elif item.transport is not None and (lat is None or lng is None):
+                lat, lng = item.transport.latitude, item.transport.longitude
+            lat, lng = float(lat), float(lng)
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                return None, None
+            return lat, lng
+        except (TypeError, ValueError):
+            return None, None
+
+    days: Dict[int, list] = {}
+    unmapped = 0
+    all_lat, all_lng = [], []
+    for item in sorted(trip.itinerary, key=lambda i: (i.day_number, i.order_index)):
+        lat, lng = _coords(item)
+        ok = lat is not None
+        if ok:
+            all_lat.append(lat)
+            all_lng.append(lng)
+        else:
+            unmapped += 1
+        days.setdefault(item.day_number, []).append({
+            "item_id": item.id, "order_index": item.order_index,
+            "item_type": item.item_type, "title": item.title,
+            "location": item.location, "start_time": item.start_time,
+            "end_time": item.end_time, "status": item.status,
+            "latitude": lat, "longitude": lng, "has_coordinates": ok,
+        })
+    dest = trip.destination
+    if all_lat:
+        center = {"latitude": round(sum(all_lat) / len(all_lat), 5),
+                  "longitude": round(sum(all_lng) / len(all_lng), 5)}
+    elif dest is not None and dest.latitude is not None:
+        center = {"latitude": dest.latitude, "longitude": dest.longitude}
+    else:
+        center = None
+    return {
+        "trip_id": trip.id,
+        "destination": {"name": dest.name if dest else None,
+                        "latitude": dest.latitude if dest else None,
+                        "longitude": dest.longitude if dest else None},
+        "center": center,
+        "days": [{"day_number": d, "stops": days[d]} for d in sorted(days)],
+        "unmapped_count": unmapped,
+    }
+
+
 @router.put("/trips/{trip_id}")
 def update_trip(trip_id: str, trip_in: TripUpdate, db: Session = Depends(get_db)):
     """Update Trip attributes and record change history."""
@@ -1580,11 +1646,24 @@ def ai_chat(payload: AIChatRequest, db: Session = Depends(get_db)):
     return result
 
 @router.post("/ai/extract-preferences")
-def ai_extract_preferences(payload: AIExtractPreferencesRequest):
-    """Extract structured travel parameters from natural language prompts."""
+def ai_extract_preferences(payload: AIExtractPreferencesRequest, db: Session = Depends(get_db)):
+    """Extract structured travel parameters from natural language prompts.
+
+    Accepts {text_prompt} or the voice-client alias {text}. Destination
+    matching uses live catalog names so new places resolve without Gemini.
+    """
+    text = ((payload.text_prompt or "") or (payload.text or "")).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text_prompt (or text) is required")
+    context = dict(payload.context or {})
+    try:
+        context.setdefault("known_destinations",
+                           [d.name for d in db.query(Destination).all()])
+    except Exception:
+        pass
     return gemini_service.extract_preferences(
-        text_prompt=payload.text_prompt,
-        context=payload.context
+        text_prompt=text,
+        context=context
     )
 
 @router.post("/research", response_model=ResearchResult)
@@ -2385,6 +2464,7 @@ def _profile_response(user: User, profile) -> dict:
         "full_name": user.full_name,
         "email": user.email,
         "phone": user.phone,
+        "has_avatar": bool(getattr(user, "avatar_image", None)),
         "travel_style": profile.travel_style or "balanced",
         "dietary_preferences": profile.dietary_preferences or [],
         "fitness_level": profile.fitness_level or "moderate",
@@ -2447,6 +2527,59 @@ def patch_traveler_profile(payload: TravelerProfileUpdate, request: Request, db:
     db.refresh(user)
     db.refresh(profile)
     return _profile_response(user, profile)
+
+
+@router.post("/traveler/avatar")
+async def upload_traveler_avatar(request: Request, db: Session = Depends(get_db)):
+    """Upload the authenticated traveler's profile photo.
+
+    Multipart field: file (image/*, max 5 MB). Stored in-DB so it survives
+    redeploys. Returns 422 for non-images/oversize, 401 without session.
+    """
+    from backend.auth.service import get_current_traveler
+    user = get_current_traveler(request, db)
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(status_code=422, detail="multipart field 'file' is required")
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=422, detail="multipart field 'file' is required")
+    mime = (getattr(upload, "content_type", None) or "").lower()
+    if not mime.startswith("image/"):
+        raise HTTPException(status_code=422, detail="only image uploads are accepted")
+    data = await upload.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="empty image upload")
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="image must be at most 5 MB")
+    user.avatar_image = bytes(data)
+    user.avatar_mime = mime[:50]
+    db.commit()
+    return {"avatar": True, "mime": user.avatar_mime, "bytes": len(data)}
+
+
+@router.get("/traveler/avatar/{user_id}")
+def get_traveler_avatar(user_id: str, db: Session = Depends(get_db)):
+    """Public profile photo bytes (avatars are not secret). 404 when unset,
+    so the UI falls back to the name initial."""
+    from fastapi.responses import Response
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not getattr(user, "avatar_image", None):
+        raise HTTPException(status_code=404, detail="No avatar set")
+    return Response(content=bytes(user.avatar_image),
+                    media_type=(user.avatar_mime or "image/jpeg"))
+
+
+@router.delete("/traveler/avatar")
+def delete_traveler_avatar(request: Request, db: Session = Depends(get_db)):
+    """Remove the authenticated traveler's photo (back to initial)."""
+    from backend.auth.service import get_current_traveler
+    user = get_current_traveler(request, db)
+    user.avatar_image = None
+    user.avatar_mime = None
+    db.commit()
+    return {"avatar": False}
 
 
 @router.get("/traveler/preferences", response_model=TravelerPreferencesRead)

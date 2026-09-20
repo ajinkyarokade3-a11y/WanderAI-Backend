@@ -36,10 +36,7 @@ from backend.schemas.schemas import AssistantChatContext, AssistantChatResult, A
 
 client = TestClient(app)
 
-@pytest.fixture(scope="session", autouse=True)
-def setup_database():
-    command.upgrade(Config("alembic.ini"), "head")
-    run_seed()
+# NOTE: session DB setup lives in tests/conftest.py (shared by all modules).
 
 
 def _evidence(label="source"):

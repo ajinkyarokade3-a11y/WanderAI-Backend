@@ -94,15 +94,32 @@ class ItineraryGenerator:
         preserved_transport_ids = {item.transport_id for item in preserved_items if item.transport_id}
         preserved_activity_ids = {item.activity_id for item in preserved_items if item.activity_id}
 
+        activity_slots = max(0, self._activity_slots(duration_days, trip.pace) - len(preserved_activity_ids))
+        required_activity_days = max(0, duration_days - 1 - len(preserved_activity_ids))
+        # Budget-honest selection: the hotel must leave room for transfers
+        # + required activities, otherwise trips silently blow past the
+        # traveler's budget (hotel eating 96% was a real case). Minimums are
+        # computed from the cheapest available options.
+        min_transport_cost = (
+            min((float(o.price or 0) for o in transport_options), default=0.0)
+            if (not preserved_transport_ids and transport_options) else 0.0
+        )
+        cheapest_activity_costs = sorted(
+            float(a.price_per_person or 0) * traveler_count for a in activities
+        )
+        min_activities_cost = sum(cheapest_activity_costs[:required_activity_days])
+
         hotel_nights = max(1, duration_days - 1)
         hotel = None
         if not preserved_hotel_ids:
             if not hotels:
                 raise ItineraryGenerationError("No active catalog hotel is available for this destination and currency")
+            hotel_pot = (remaining_budget - min_transport_cost - min_activities_cost
+                         if remaining_budget is not None else None)
             hotel = self._first_within_budget(
                 hotels,
                 lambda candidate: float(candidate.price_per_night or 0) * hotel_nights,
-                remaining_budget,
+                hotel_pot,
             )
             if not hotel:
                 raise ItineraryGenerationError("No active catalog hotel fits the trip budget")
@@ -116,27 +133,45 @@ class ItineraryGenerator:
         if not preserved_transport_ids and transport_options:
             # Transfers are optional: skip when the destination has no
             # transport inventory (or none fits the budget) instead of
-            # failing trip generation.
+            # failing trip generation. Selection leaves the reserved
+            # activity minimum untouched.
+            transport_pot = (remaining_budget - min_activities_cost
+                             if remaining_budget is not None else None)
             transport = self._first_within_budget(
                 transport_options,
                 lambda candidate: float(candidate.price or 0),
-                remaining_budget,
+                transport_pot,
             )
             if transport:
                 remaining_budget = self._subtract_budget(remaining_budget, float(transport.price or 0))
 
-        activity_slots = max(0, self._activity_slots(duration_days, trip.pace) - len(preserved_activity_ids))
-        required_activity_days = max(0, duration_days - 1 - len(preserved_activity_ids))
         if activity_slots > 0 and not activities:
             raise ItineraryGenerationError("No active catalog activities are available for this destination and currency")
         selected_activities = []
         selected_activity_ids = set(preserved_activity_ids)
-        for activity in activities:
-            if len(selected_activities) >= activity_slots or activity.id in selected_activity_ids:
+        priced = []
+        seen_ids = set(selected_activity_ids)
+        for a in activities:
+            if a.id in seen_ids:
                 continue
-            cost = float(activity.price_per_person or 0) * traveler_count
-            needs_activity_for_duration = len(selected_activities) < required_activity_days
-            if remaining_budget is not None and cost > remaining_budget and not needs_activity_for_duration:
+            seen_ids.add(a.id)
+            priced.append((a, float(a.price_per_person or 0) * traveler_count))
+        # Affordable in ranked order first (preference match wins). Only to
+        # reach the required minimum, the cheapest remaining ones follow —
+        # never an expensive forced pick that blows the budget.
+        affordable = [(a, c) for a, c in priced
+                      if remaining_budget is None or c <= remaining_budget]
+        pricey_ids = {a.id for a, c in priced
+                      if remaining_budget is not None and c > remaining_budget}
+        pricey = sorted(((a, c) for a, c in priced if a.id in pricey_ids),
+                        key=lambda t: t[1])
+        for activity, cost in affordable + pricey:
+            if len(selected_activities) >= activity_slots:
+                break
+            if activity.id in pricey_ids:
+                if len(selected_activities) >= required_activity_days:
+                    continue
+            elif remaining_budget is not None and cost > remaining_budget:
                 continue
             selected_activities.append(activity)
             selected_activity_ids.add(activity.id)

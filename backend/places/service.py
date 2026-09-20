@@ -147,6 +147,13 @@ def get_live_places(destination: str, latitude: Any, longitude: Any, limit: int,
         return {"destination": display, "latitude": None, "longitude": None,
                 "places": [], "source": "none"}
     attractions = fetch_attractions(lat, lng, overpass_url, timeout_s, radius_m, limit)
+    try:
+        wide = int(radius_m or 0)
+    except (TypeError, ValueError):
+        wide = 0
+    if not attractions and wide > 10000:
+        # Dense metros often time out wide queries; a tighter radius answers fast.
+        attractions = fetch_attractions(lat, lng, overpass_url, timeout_s, 10000, limit)
     images = fetch_place_images(lat, lng, commons_url, timeout_s, radius_m, max(10, limit)) if attractions else []
     places = []
     for index, place in enumerate(attractions):
