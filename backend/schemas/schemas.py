@@ -224,6 +224,13 @@ class TravelerTripSummary(BaseModel):
     status: str = "planning"
     updated_at: Optional[str] = None
     traveler_profile: Optional[TravelerProfileRead] = None
+    # Enrichment for trip-history cards. All optional and sourced from the
+    # saved snapshot/row — never fabricated. Older snapshots simply omit them.
+    total_budget: Optional[float] = None
+    total_cost: Optional[float] = None
+    hero_image_url: Optional[str] = None
+    traveler_count: Optional[int] = None
+    created_at: Optional[str] = None
 
 # Destination Schemas
 class DestinationBase(BaseModel):

@@ -200,6 +200,9 @@ def login_traveler(db: Session, email: str, password: str) -> Dict[str, Any]:
 def _snapshot_summary(row: Trip) -> Dict[str, Any]:
     snap = row.canonical_snapshot if isinstance(row.canonical_snapshot, dict) else {}
     dest = snap.get("destination") if isinstance(snap.get("destination"), dict) else {}
+    total_budget = snap.get("total_budget")
+    total_cost = snap.get("total_cost")
+    traveler_count = snap.get("traveler_count")
     return {
         "trip_id": row.id,
         "title": snap.get("title") or row.title,
@@ -213,6 +216,15 @@ def _snapshot_summary(row: Trip) -> Dict[str, Any]:
             row.updated_at.isoformat()
             if getattr(row, "updated_at", None)
             else snap.get("updated_at")
+        ),
+        "total_budget": total_budget if isinstance(total_budget, (int, float)) else None,
+        "total_cost": total_cost if isinstance(total_cost, (int, float)) else None,
+        "hero_image_url": dest.get("hero_image_url") or None,
+        "traveler_count": traveler_count if isinstance(traveler_count, int) else None,
+        "created_at": (
+            row.created_at.isoformat()
+            if getattr(row, "created_at", None)
+            else snap.get("created_at")
         ),
     }
 
