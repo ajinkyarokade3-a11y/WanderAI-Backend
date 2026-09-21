@@ -45,5 +45,21 @@ class Settings(BaseSettings):
     TRAVELER_JWT_SECRET: str = "dev-only-traveler-jwt-secret-change-in-production"
     TRAVELER_JWT_EXPIRY_DAYS: int = 7
 
+
 settings = Settings()
+
+
+def resolve_db_url(url: str) -> str:
+    """Normalize a DATABASE_URL to the psycopg (v3) SQLAlchemy dialect.
+
+    Bare ``postgres://`` / ``postgresql://`` schemes default to the psycopg2
+    driver, which is not installed — rewrite them to ``postgresql+psycopg``.
+    Explicitly qualified URLs (``postgresql+psycopg://``, ``sqlite:///...``)
+    pass through untouched.
+    """
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
 

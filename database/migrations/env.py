@@ -11,7 +11,7 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Import settings and metadata
-from backend.database.config import settings
+from backend.database.config import resolve_db_url, settings
 from backend.database.connection import Base
 import backend.models.models  # Ensure all models are registered
 
@@ -23,10 +23,7 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 def get_db_url() -> str:
-    url = settings.DATABASE_URL
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
+    return resolve_db_url(settings.DATABASE_URL)
 
 def run_migrations_offline() -> None:
     url = get_db_url()

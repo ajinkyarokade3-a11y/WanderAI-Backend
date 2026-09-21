@@ -1,12 +1,10 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from backend.database.config import settings
+from backend.database.config import resolve_db_url, settings
 
-# Parse Database URL
-db_url = settings.DATABASE_URL
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+# Parse Database URL (psycopg v3 dialect; see resolve_db_url)
+db_url = resolve_db_url(settings.DATABASE_URL)
 
 # SQLite specific connect_args
 connect_args = {}
