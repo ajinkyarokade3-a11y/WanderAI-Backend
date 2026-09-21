@@ -627,8 +627,13 @@ def test_itinerary_generator_consumes_ranked_catalog_without_duplicates(monkeypa
         catalog_activities = {item.id: item for item in db.query(Activity).filter(Activity.id.in_([
             "act-manali-004", "act-manali-003", "act-manali-001",
         ])).all()}
-        assert next(item.cost for item in items if item.hotel_id) == hotel.price_per_night * 2
         assert next(item.cost for item in items if item.transport_id) == transport.price
+        # Day-wise stays: one item per night at the nightly rate; the summed
+        # stay cost still equals the whole-trip hotel total.
+        hotel_items = [item for item in items if item.hotel_id]
+        assert hotel_items, "expected per-night hotel items"
+        assert all(item.cost == hotel.price_per_night for item in hotel_items)
+        assert sum(item.cost for item in hotel_items) == hotel.price_per_night * 2
         assert [item.cost for item in activities] == [
             catalog_activities[item.activity_id].price_per_person * 3 for item in activities
         ]

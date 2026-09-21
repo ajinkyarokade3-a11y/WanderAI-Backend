@@ -209,7 +209,8 @@ def _hotel_option(hotel: Hotel, trip: Trip, badge: str) -> Dict[str, Any]:
             "price_per_night": price_per_night, "total_price": price_per_night * nights,
             "nights": nights, "amenities": hotel.amenities or [],
             "why_it_matches": f"Verified catalog {hotel.category} stay in {dest_name} rated {hotel.rating}.",
-            "hero_image": images[0] if images else None, "images": images, "badge": badge}
+            "hero_image": images[0] if images else None, "images": images, "badge": badge,
+            "latitude": hotel.latitude, "longitude": hotel.longitude}
 
 
 def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
@@ -2065,12 +2066,26 @@ def _change_accommodation(trip_id: str, payload: Dict[str, Any], db: Session, da
                                    Hotel.is_active == True).first()
     if not hotel:
         raise HTTPException(status_code=400, detail="Accommodation option not found")
-    day = int(payload.get("day_number") or 1) if daily else 1
-    item = next((i for i in trip.itinerary if i.item_type == "hotel" and i.day_number == day), None)
-    if not item:
-        item = ItineraryItem(trip_id=trip.id, day_number=day, order_index=99, item_type="hotel", title=hotel.name)
-        db.add(item)
-    item.hotel_id, item.title, item.description, item.location, item.cost, item.status = hotel.id, hotel.name, hotel.description, hotel.address, hotel.price_per_night, "confirmed"
+    if daily:
+        # Day-scoped change: only the single night's stay item is touched;
+        # every other day keeps its own hotel assignment.
+        day = int(payload.get("day_number") or 1)
+        targets = [i for i in trip.itinerary if i.item_type == "hotel" and i.day_number == day]
+        if not targets:
+            item = ItineraryItem(trip_id=trip.id, day_number=day, order_index=99, item_type="hotel", title=hotel.name)
+            db.add(item)
+            targets = [item]
+    else:
+        # Explicit global change: every overnight stay item moves to the
+        # selected hotel (single-stay trips keep their one item, so legacy
+        # behavior is unchanged).
+        targets = [i for i in trip.itinerary if i.item_type == "hotel"]
+        if not targets:
+            item = ItineraryItem(trip_id=trip.id, day_number=1, order_index=99, item_type="hotel", title=hotel.name)
+            db.add(item)
+            targets = [item]
+    for item in targets:
+        item.hotel_id, item.title, item.description, item.location, item.cost, item.status = hotel.id, hotel.name, hotel.description, hotel.address, hotel.price_per_night, "confirmed"
     return _commit_trip(db, trip, "hotel_changed", "hotel", hotel.name, "Traveler selected a catalog hotel.")
 
 

@@ -1,11 +1,18 @@
 """Persist catalog-grounded generated and optimized trip itinerary items."""
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Type
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 from sqlalchemy.orm import Session
+from types import SimpleNamespace
 
 from backend.models.models import Activity, Hotel, ItineraryItem, TransportOption, Trip
 from backend.recommendation.engine import RecommendationEngine
+from backend.itinerary.hotel_assignment import (
+    DayAnchor,
+    OvernightStay,
+    centroid,
+    plan_overnight_stays,
+)
 
 
 class ItineraryGenerationError(Exception):
@@ -61,7 +68,9 @@ class ItineraryGenerator:
         self.db.add_all(new_items)
         if commit:
             self.db.commit()
-        return new_items
+        # Sorted like _trip_items so callers see days in order regardless of
+        # build sequence (multi-night stays are emitted before activities).
+        return self._sorted_items(new_items)
 
     def _ranked_items(
         self,
@@ -90,7 +99,6 @@ class ItineraryGenerator:
         duration_days = self._duration_days(trip)
         traveler_count = self._traveler_count(trip)
         remaining_budget = self._remaining_budget(trip, preserved_items)
-        preserved_hotel_ids = {item.hotel_id for item in preserved_items if item.hotel_id}
         preserved_transport_ids = {item.transport_id for item in preserved_items if item.transport_id}
         preserved_activity_ids = {item.activity_id for item in preserved_items if item.activity_id}
 
@@ -110,24 +118,25 @@ class ItineraryGenerator:
         min_activities_cost = sum(cheapest_activity_costs[:required_activity_days])
 
         hotel_nights = max(1, duration_days - 1)
-        hotel = None
-        if not preserved_hotel_ids:
-            if not hotels:
-                raise ItineraryGenerationError("No active catalog hotel is available for this destination and currency")
-            hotel_pot = (remaining_budget - min_transport_cost - min_activities_cost
-                         if remaining_budget is not None else None)
-            hotel = self._first_within_budget(
-                hotels,
-                lambda candidate: float(candidate.price_per_night or 0) * hotel_nights,
-                hotel_pot,
-            )
-            if not hotel:
-                raise ItineraryGenerationError("No active catalog hotel fits the trip budget")
-            if hotel:
-                remaining_budget = self._subtract_budget(
-                    remaining_budget,
-                    float(hotel.price_per_night or 0) * hotel_nights,
-                )
+        # NOTE: hotel economics keep the legacy order: a base stay is
+        # reserved here (before transfers/activities pick), so activity
+        # selection sees exactly the remainder it always has. Proximity
+        # planning later spends within that same reserved envelope, and any
+        # unspent part is refunded — trip totals can only match or beat the
+        # previous single-hotel totals. The minimums below only feed the
+        # transport reservation.
+        hotel_pot = (remaining_budget - min_transport_cost - min_activities_cost
+                     if remaining_budget is not None else None)
+        pinned_days = {
+            item.day_number
+            for item in preserved_items
+            if item.item_type == "hotel" and 1 <= item.day_number <= hotel_nights
+        }
+        open_nights = [n for n in range(1, hotel_nights + 1) if n not in pinned_days]
+        base_hotel, base_total = self._reserve_base_hotel(
+            hotels, open_nights, hotel_pot
+        )
+        remaining_budget = self._subtract_budget(remaining_budget, base_total)
 
         transport = None
         if not preserved_transport_ids and transport_options:
@@ -202,32 +211,62 @@ class ItineraryGenerator:
                 )
             )
 
-        if hotel:
+        # Activity placement first: overnight anchors are derived from the
+        # placed sightseeing days, so hotels follow the itinerary geography.
+        placements: List[Tuple[Any, int, int, str]] = []
+        for index, activity in enumerate(selected_activities):
+            day_number, preferred_order, start_time = self._activity_slot(index, duration_days)
+            placements.append((activity, day_number, preferred_order, start_time))
+
+        # True hotel allowance: base_total was reserved up front, so add it
+        # back to the live remainder. Spending within this allowance keeps
+        # the trip total budget-honest while allowing pricier nearby stays.
+        hotel_allowance = (
+            remaining_budget + base_total
+            if remaining_budget is not None
+            else None
+        )
+        stays, hotel_spent = self._plan_stays(
+            trip, hotels, hotel_nights, base_hotel, base_total,
+            hotel_allowance, preserved_items, placements
+        )
+        # Base total was reserved up front; only the difference between the
+        # proximity plan's actual spend and the reservation moves the budget.
+        remaining_budget = self._subtract_budget(
+            remaining_budget, hotel_spent - base_total
+        )
+        covered_nights = {
+            item.day_number
+            for item in preserved_items
+            if item.item_type == "hotel" and 1 <= item.day_number <= hotel_nights
+        }
+        for stay in stays:
+            if stay.night in covered_nights or stay.hotel is None:
+                continue
+            hotel_ui = self._entity_ui_meta(stay.hotel)
+            hotel_ui["hotel_assignment_reason"] = stay.reason
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
-                    day_number=1,
-                    order_index=self._available_order(1, 2, used_orders),
+                    day_number=stay.night,
+                    order_index=self._available_order(stay.night, 2, used_orders),
                     item_type="hotel",
-                    title=hotel.name,
-                    description=hotel.description,
+                    title=stay.hotel.name,
+                    description=stay.hotel.description,
                     start_time="01:30 PM",
                     end_time="03:00 PM",
-                    cost=float(hotel.price_per_night or 0) * hotel_nights,
+                    cost=float(stay.hotel.price_per_night or 0),
                     status="proposed",
-                    hotel_id=hotel.id,
-                    location=hotel.address or hotel.name,
-                    meta_data={"ui": self._entity_ui_meta(hotel)},
+                    hotel_id=stay.hotel.id,
+                    location=stay.hotel.address or stay.hotel.name,
+                    meta_data={"ui": hotel_ui},
                 )
             )
 
         # Proportional distribution: activities spread across the whole
         # trip, up to 2 per day (morning + afternoon). Thin inventories
         # yield ~1/day; rich ones fill both daily slots.
-        total_selected = len(selected_activities)
-        day_slot_counts: Dict[int, int] = {}
-        for index, activity in enumerate(selected_activities):
-            day_number, preferred_order, start_time = self._activity_slot(index, duration_days)
+        for activity, day_number, preferred_order, start_time in placements:
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
@@ -245,13 +284,195 @@ class ItineraryGenerator:
                     meta_data={"ui": self._entity_ui_meta(activity)},
                 )
             )
-        departure_note = self._departure_note(trip, preserved_items, new_items, hotel, transport)
+        departure_note = self._departure_note(
+            trip, preserved_items, new_items,
+            [stay.hotel for stay in stays], transport,
+        )
         if departure_note is not None:
             departure_note.order_index = self._available_order(
                 departure_note.day_number, departure_note.order_index, occupied_orders
             )
             new_items.append(departure_note)
         return new_items
+
+    def _reserve_base_hotel(
+        self,
+        hotels: Sequence[Any],
+        open_nights: Sequence[int],
+        hotel_pot: Optional[float],
+    ) -> Tuple[Optional[Any], float]:
+        """Legacy whole-trip reservation: best-ranked hotel whose nightly
+        rate fits every uncovered night. Same selection and errors as the
+        previous single-hotel logic; the returned total is reserved up
+        front and proximity planning later spends within it."""
+        if not open_nights:
+            return None, 0.0
+        if not hotels:
+            raise ItineraryGenerationError("No active catalog hotel is available for this destination and currency")
+        for hotel in hotels:
+            try:
+                price = float(hotel.price_per_night or 0)
+            except (TypeError, ValueError):
+                continue
+            if hotel_pot is None or price * len(open_nights) <= hotel_pot:
+                return hotel, price * len(open_nights)
+        raise ItineraryGenerationError("No active catalog hotel fits the trip budget")
+
+    def _plan_stays(
+        self,
+        trip: Trip,
+        hotels: Sequence[Any],
+        hotel_nights: int,
+        base_hotel: Optional[Any],
+        base_total: float,
+        hotel_allowance: Optional[float],
+        preserved_items: Sequence[ItineraryItem],
+        placements: Sequence[Tuple[Any, int, int, str]],
+    ) -> Tuple[List[OvernightStay], float]:
+        """Plan one hotel per overnight stay using proximity logic.
+
+        Nights already covered by preserved hotel items (including
+        traveler-confirmed picks and live selections) are pinned and never
+        reassigned. Newly assigned nights spend within ``hotel_allowance``
+        (the true post-transfer/activity hotel budget), so trip totals stay
+        budget-honest; preserved nights cost nothing extra here because
+        their cost is already counted upstream.
+        """
+        nights = max(1, int(hotel_nights or 1))
+        pinned: Dict[int, Any] = {}
+        for item in preserved_items:
+            if item.item_type != "hotel" or not 1 <= item.day_number <= nights:
+                continue
+            if item.hotel_id:
+                hotel_row = self.db.query(Hotel).filter(Hotel.id == item.hotel_id).first()
+                if hotel_row is not None:
+                    pinned[item.day_number] = hotel_row
+                    continue
+            ui = (item.meta_data or {}).get("ui", {}) or {}
+            pinned[item.day_number] = SimpleNamespace(
+                id=f"custom:{item.id}",
+                name=item.title,
+                description=item.description,
+                address=item.location,
+                latitude=ui.get("latitude"),
+                longitude=ui.get("longitude"),
+                price_per_night=0.0,
+            )
+
+        activities_by_day: Dict[int, List[Any]] = {}
+        for activity, day_number, _, _ in placements:
+            activities_by_day.setdefault(day_number, []).append(activity)
+        preserved_activity_ids = {
+            item.activity_id
+            for item in preserved_items
+            if item.item_type == "activity" and item.activity_id
+        }
+        if preserved_activity_ids:
+            for row in (
+                self.db.query(Activity)
+                .filter(Activity.id.in_(sorted(preserved_activity_ids)))
+                .all()
+            ):
+                day = next(
+                    (
+                        item.day_number
+                        for item in preserved_items
+                        if item.item_type == "activity" and item.activity_id == row.id
+                    ),
+                    None,
+                )
+                if day is not None:
+                    activities_by_day.setdefault(day, []).append(row)
+
+        dest_name = trip.destination.name if trip.destination else "the trip area"
+        dest_point = (
+            (trip.destination.latitude, trip.destination.longitude)
+            if trip.destination
+            else (None, None)
+        )
+        anchors: Dict[int, DayAnchor] = {}
+        for night in range(1, nights + 1):
+            day_acts = [
+                a
+                for a in activities_by_day.get(night + 1, [])
+                if getattr(a, "latitude", None) is not None
+                and getattr(a, "longitude", None) is not None
+            ] or [
+                a
+                for a in activities_by_day.get(night, [])
+                if getattr(a, "latitude", None) is not None
+                and getattr(a, "longitude", None) is not None
+            ]
+            if day_acts:
+                point = centroid([(a.latitude, a.longitude) for a in day_acts])
+                label = str(getattr(day_acts[0], "title", None) or dest_name)
+                if len(day_acts) > 1:
+                    label = f"{label} (+{len(day_acts) - 1} more)"
+                if point is not None:
+                    anchors[night] = DayAnchor(
+                        latitude=point[0], longitude=point[1], label=label
+                    )
+                    continue
+            if dest_point[0] is not None and dest_point[1] is not None:
+                try:
+                    anchors[night] = DayAnchor(
+                        latitude=float(dest_point[0]),
+                        longitude=float(dest_point[1]),
+                        label=dest_name,
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+        needs_assignment = any(
+            night not in pinned for night in range(1, nights + 1)
+        )
+        if needs_assignment and base_hotel is None and not hotels:
+            raise ItineraryGenerationError("No active catalog hotel is available for this destination and currency")
+        stays, spent = plan_overnight_stays(
+            nights=nights,
+            anchors=anchors,
+            hotels=hotels,
+            pinned_hotels=pinned,
+            total_pot=hotel_allowance,
+        )
+        uncovered = [
+            stay for stay in stays
+            if stay.night not in pinned and stay.hotel is None
+        ]
+        if uncovered:
+            if base_hotel is None:
+                raise ItineraryGenerationError("No active catalog hotel fits the trip budget")
+            # Proximity moves left a later night unaffordable: keep one
+            # retained base stay (exactly the reserved total) instead of
+            # failing the trip.
+            try:
+                nightly = float(base_hotel.price_per_night or 0)
+            except (TypeError, ValueError):
+                nightly = 0.0
+            rebuilt: List[OvernightStay] = []
+            for stay in stays:
+                if stay.night in pinned:
+                    rebuilt.append(stay)
+                    continue
+                rebuilt.append(
+                    OvernightStay(
+                        night=stay.night,
+                        hotel=base_hotel,
+                        reason=(
+                            f"Keeping one base stay at {base_hotel.name} to hold "
+                            "the trip budget."
+                        ),
+                        distance_km=stay.distance_km,
+                        travel_minutes=stay.travel_minutes,
+                        retained=True,
+                    )
+                )
+            open_count = sum(1 for stay in stays if stay.night not in pinned)
+            stays, spent = rebuilt, nightly * open_count
+        for stay in stays:
+            if stay.night not in pinned and stay.hotel is None:
+                raise ItineraryGenerationError("No active catalog hotel fits the trip budget")
+        return stays, spent
 
     def _trip_items(self, trip: Trip) -> List[ItineraryItem]:
         return self._sorted_items(
@@ -379,7 +600,7 @@ class ItineraryGenerator:
         trip: Trip,
         preserved_items: Sequence[ItineraryItem],
         new_items: Sequence[ItineraryItem],
-        hotel: Any,
+        stay_hotels: Sequence[Any],
         transport: Any,
     ) -> Optional[ItineraryItem]:
         """Append a derived check-out/departure note when the last day is empty.
@@ -394,9 +615,14 @@ class ItineraryGenerator:
             return None
         if any(item.day_number == duration_days for item in new_items):
             return None
-        stay_name = hotel.name if hotel is not None else next(
-            (item.title for item in preserved_items if item.item_type == "hotel"), None
+        stay_name = next(
+            (hotel.name for hotel in reversed(list(stay_hotels)) if hotel is not None),
+            None,
         )
+        if stay_name is None:
+            stay_name = next(
+                (item.title for item in preserved_items if item.item_type == "hotel"), None
+            )
         ride_name = transport.name if transport is not None else next(
             (item.title for item in preserved_items if item.item_type == "transport"), None
         )
