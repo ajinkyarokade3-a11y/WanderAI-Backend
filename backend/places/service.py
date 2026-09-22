@@ -11,7 +11,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-_USER_AGENT = "TourFlowAI/1.0 (travel planning prototype)"
+# Wikimedia blocks contact-less crawlers (HTTP 403 robot policy) and caps
+# geosearch radius at 10km (wider radii silently return zero pages).
+_USER_AGENT = "TourFlowAI/1.0 (https://github.com/ajinkyarokade3-a11y/WanderAI-Backend)"
+_COMMONS_MAX_RADIUS_M = 10000
 
 # OSM tags treated as visitable places.
 _PLACE_QUERIES = (
@@ -107,7 +110,8 @@ def fetch_place_images(latitude: float, longitude: float, base_url: str,
     try:
         response = _http_get(base_url, {
             "action": "query", "generator": "geosearch", "ggscoord": f"{lat}|{lon}",
-            "ggsradius": int(radius_m), "ggsnamespace": 6,
+            "ggsradius": max(1, min(int(radius_m), _COMMONS_MAX_RADIUS_M)),
+            "ggsnamespace": 6,
             "ggslimit": max(1, min(int(limit), 50)),
             "prop": "imageinfo", "iiprop": "url|size", "iiurlwidth": 800, "format": "json",
         }, timeout_s)
@@ -173,6 +177,35 @@ def reverse_geocode(latitude: Any, longitude: Any, base_url: str,
             "display_name": str(payload.get("display_name") or "")}
 
 
+def fetch_image_for_name(name: Any, base_url: str, timeout_s: float) -> Optional[str]:
+    """Single best Commons thumbnail for a place name (text search).
+
+    Used when no geotagged photo exists nearby. Never raises.
+    """
+    query = (name or "").strip() if isinstance(name, str) else ""
+    if not query:
+        return None
+    try:
+        response = _http_get(base_url, {
+            "action": "query", "generator": "search", "gsrsearch": query,
+            "gsrnamespace": 6, "gsrlimit": 5,
+            "prop": "imageinfo", "iiprop": "url|size", "iiurlwidth": 800, "format": "json",
+        }, timeout_s)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    pages = ((payload.get("query") or {}).get("pages") or {}).values() if isinstance(payload, dict) else []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        for entry in page.get("imageinfo") or []:
+            url = (entry or {}).get("thumburl") or (entry or {}).get("url")
+            if isinstance(url, str) and url.startswith(_COMMONS_FILE_DOMAIN):
+                return url
+    return None
+
+
 def get_live_places(destination: str, latitude: Any, longitude: Any, limit: int,
                     nominatim_url: str, overpass_url: str, commons_url: str,
                     timeout_s: float, radius_m: int) -> Dict[str, Any]:
@@ -201,8 +234,13 @@ def get_live_places(destination: str, latitude: Any, longitude: Any, limit: int,
         attractions = fetch_attractions(lat, lng, overpass_url, timeout_s, 10000, limit)
     images = fetch_place_images(lat, lng, commons_url, timeout_s, radius_m, max(10, limit)) if attractions else []
     places = []
+    name_lookups = 0
     for index, place in enumerate(attractions):
         image = images[index % len(images)] if images else None
+        if image is None and name_lookups < 5:
+            # No geotagged photo nearby: try the place name itself (free).
+            name_lookups += 1
+            image = fetch_image_for_name(place.get("name"), commons_url, timeout_s)
         places.append({**place, "image_url": image})
     return {"destination": display, "latitude": lat, "longitude": lng,
             "places": places, "source": "overpass+commons"}

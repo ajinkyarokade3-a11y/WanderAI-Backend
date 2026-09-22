@@ -186,6 +186,138 @@ def test_generation_stays_within_budget():
     assert client.delete(f"/api/trips/{r.json()['id']}").status_code == 200
 
 
+def test_budget_shortfall_names_cheapest_workable_total():
+    """Kashmir replay: 5 days, 4 travelers, low budget -> 422 naming the
+    minimum viable total instead of a bare failure."""
+    kas_id = client.get("/api/destinations/kashmir").json()["id"]
+    r = client.post("/api/trips", json={
+        "title": "Too Cheap Kashmir",
+        "destination_id": kas_id,
+        "duration_days": 5,
+        "traveler_count": 4,
+        "total_budget": 20000.0,
+        "currency": "INR",
+    })
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "cheapest workable plan" in detail
+    assert "55,000" in detail
+
+
+def _end_minutes(value):
+    parts = (value or "").strip().split()
+    if len(parts) != 2:
+        return None
+    hm, period = parts
+    try:
+        h, m = int(hm.split(":")[0]), int(hm.split(":")[1])
+    except (ValueError, IndexError):
+        return None
+    h = h % 12 + (12 if period.upper() == "PM" else 0)
+    return h * 60 + m
+
+
+def test_long_activity_never_ends_after_midnight(monkeypatch):
+    """A 7-hour hike must land on a morning with room (swapped if needed),
+    never as an evening filler ending past midnight."""
+    import uuid as _uuid
+    from backend.database.connection import SessionLocal
+    from backend.models.models import (Activity, Destination, Hotel,
+                                       ItineraryItem, TransportOption, Trip)
+    import backend.itinerary.generator as itinerary_generator
+
+    tag = _uuid.uuid4().hex[:8]
+    db = SessionLocal()
+    trip = None
+    dest = None
+    try:
+        dest = Destination(
+            id=f"dst-long-{tag}", name=f"Longville {tag}", slug=f"longville-{tag}",
+            country="India", state_region="Longville", description="Long activity test.",
+            inventory_source="catalog", verification_status="catalog_verified",
+            latitude=32.24, longitude=77.19)
+        db.add(dest)
+        db.flush()
+        hotel = Hotel(id=f"htl-long-{tag}", destination_id=dest.id, name="Long Stay",
+                      price_per_night=3000.0, currency="INR", rating=4.5,
+                      inventory_source="catalog", verification_status="catalog_verified",
+                      is_active=True, latitude=32.24, longitude=77.19)
+        transport = TransportOption(
+            id=f"trn-long-{tag}", destination_id=dest.id, type="private_cab",
+            name="Long Cab", route_from="A", route_to="B", duration_hours=2.0,
+            price=1500.0, currency="INR", capacity=6,
+            inventory_source="catalog", verification_status="catalog_verified",
+            is_active=True, latitude=32.24, longitude=77.19)
+        db.add_all([hotel, transport])
+        specs = [("Long Haul Hike", 7.0), ("Short Walk A", 2.0),
+                 ("Short Walk B", 2.0), ("Short Walk C", 2.0)]
+        aids = []
+        for idx, (title, dur) in enumerate(specs):
+            a = Activity(
+                id=f"act-long-{tag}-{idx}", destination_id=dest.id, title=title,
+                category="adventure", duration_hours=dur, price_per_person=500.0,
+                currency="INR", rating=4.5,
+                inventory_source="catalog", verification_status="catalog_verified",
+                is_active=True, latitude=32.24, longitude=77.19)
+            db.add(a)
+            aids.append(a.id)
+        db.commit()
+
+        class StubEngine:
+            def __init__(self, db):
+                pass
+
+            def get_recommendations(self, destination_id, preferences, discovery_session_id=None):
+                return {"ai_insights": None,
+                        "recommended_hotels": [{"id": hotel.id}],
+                        "recommended_activities": [{"id": i} for i in aids],
+                        "recommended_transport": [{"id": transport.id}]}
+
+        monkeypatch.setattr(itinerary_generator, "RecommendationEngine", StubEngine)
+        trip = Trip(user_id="usr-alex-morgan-001", destination_id=dest.id,
+                    title=f"Long {tag}", duration_days=3, total_budget=500000.0,
+                    currency="INR", traveler_count=2, pace="balanced")
+        db.add(trip)
+        db.commit()
+        items = itinerary_generator.ItineraryGenerator(db).generate_for_trip(trip.id)
+        for item in items:
+            if item.item_type == "activity":
+                end = _end_minutes(item.end_time)
+                assert end is not None and end <= 22 * 60 + 30, (item.title, item.end_time)
+    finally:
+        if trip is not None:
+            db.query(ItineraryItem).filter(ItineraryItem.trip_id == trip.id).delete()
+            db.query(Trip).filter(Trip.id == trip.id).delete()
+            db.commit()
+        if dest is not None:
+            db.query(Activity).filter(Activity.destination_id == dest.id).delete()
+            db.query(Hotel).filter(Hotel.destination_id == dest.id).delete()
+            db.query(TransportOption).filter(TransportOption.destination_id == dest.id).delete()
+            db.query(Destination).filter(Destination.id == dest.id).delete()
+            db.commit()
+        db.close()
+
+
+def test_catalog_rows_carry_coordinates():
+    """Every active catalog hotel/activity/transport needs coordinates:
+    coord-less rows silently disable route verification, swaps, and map
+    pins (the 19:30 Hampta case). Live provider rows are exempt."""
+    from backend.database.connection import SessionLocal
+    from backend.models.models import Activity, Hotel, TransportOption
+    db = SessionLocal()
+    try:
+        for model, label in ((Hotel, "hotel"), (Activity, "activity"),
+                             (TransportOption, "transport")):
+            rows = db.query(model).filter(
+                model.is_active == True,  # noqa: E712
+                model.inventory_source == "catalog").all()
+            assert rows, f"no catalog {label} rows"
+            blank = [r.id for r in rows if r.latitude is None or r.longitude is None]
+            assert not blank, f"catalog {label} rows without coordinates: {blank}"
+    finally:
+        db.close()
+
+
 def test_legacy_items_resolve_images_from_catalog():
     """Trips generated before image metadata existed still render photos
     via the catalog fallback in the trip serializer."""
