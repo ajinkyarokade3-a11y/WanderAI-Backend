@@ -35,6 +35,16 @@ class SerpApiRestaurantError(Exception):
     """Raised when the SerpApi restaurant request fails or returns unusable data."""
 
 
+def _redact_key(text: Any) -> str:
+    """Strip credential query params from provider error text.
+
+    httpx embeds the request URL (including ``api_key=...``) in HTTP
+    errors; this content reaches API error responses and server logs, so
+    the key value must never survive here.
+    """
+    return re.sub(r"(api_?key=)[^&\s]*", r"\1[REDACTED]", str(text), flags=re.IGNORECASE)
+
+
 # In-memory cache: one provider call per unique destination query per process.
 # Prevents repeated serial searches when several meals share a destination.
 _restaurant_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -206,7 +216,7 @@ def search_serpapi_restaurants(
     except httpx.TimeoutException as exc:
         raise SerpApiRestaurantError("Restaurant search timed out") from exc
     except httpx.HTTPError as exc:
-        raise SerpApiRestaurantError(f"Restaurant search failed: {exc}") from exc
+        raise SerpApiRestaurantError(f"Restaurant search failed: {_redact_key(exc)}") from exc
     try:
         payload = response.json()
     except ValueError as exc:

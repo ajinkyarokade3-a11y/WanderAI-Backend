@@ -113,6 +113,66 @@ def test_close_anchors_retain_single_hotel():
     assert spent == pytest.approx(2000.0 * 3)
 
 
+def test_opening_stay_nearby_keeps_near_wording():
+    hotels = [_stub_hotel("H1", *AMRITSAR)]
+    stays, _ = plan_overnight_stays(
+        nights=1,
+        anchors={1: DayAnchor(latitude=AMRITSAR[0], longitude=AMRITSAR[1], label="Spot")},
+        hotels=hotels,
+    )
+    assert stays[0].reason == "Opening stay near Spot."
+    assert stays[0].distance_km == pytest.approx(0.0)
+
+
+def test_opening_stay_far_avoids_near_wording():
+    kochi = (9.9658, 76.2421)
+    kovalam = (8.4004, 76.9787)
+    hotels = [_stub_hotel("H1", *kochi)]
+    stays, _ = plan_overnight_stays(
+        nights=1,
+        anchors={1: DayAnchor(latitude=kovalam[0], longitude=kovalam[1], label="Day 2")},
+        hotels=hotels,
+    )
+    assert "near" not in stays[0].reason
+    assert "about 192 km" in stays[0].reason
+    assert "Day 2" in stays[0].reason
+    assert stays[0].distance_km == pytest.approx(192, abs=2.0)
+
+
+def test_opening_stay_missing_hotel_coords_honest():
+    hotels = [_stub_hotel("H1", None, None)]
+    stays, _ = plan_overnight_stays(
+        nights=1,
+        anchors={1: DayAnchor(latitude=10.0, longitude=20.0, label="Spot")},
+        hotels=hotels,
+    )
+    assert stays[0].reason == "Opening stay for Spot."
+    assert stays[0].distance_km is None
+    assert "near" not in stays[0].reason
+
+
+def test_opening_stay_missing_anchor_honest():
+    hotels = [_stub_hotel("H1", *AMRITSAR)]
+    stays, _ = plan_overnight_stays(nights=1, anchors={}, hotels=hotels)
+    assert stays[0].reason == "Opening stay for the trip area."
+    assert stays[0].distance_km is None
+
+
+def test_later_night_reasons_unchanged():
+    hotels = [_stub_hotel("H-Amritsar", *AMRITSAR), _stub_hotel("H-Ludhiana", *LUDHIANA)]
+    stays, _ = plan_overnight_stays(
+        nights=3,
+        anchors=_anchors(AMRITSAR, LUDHIANA, LUDHIANA),
+        hotels=hotels,
+    )
+    assert stays[0].hotel.id == "stub-H-Amritsar"
+    assert stays[1].hotel.id == "stub-H-Ludhiana"
+    assert not stays[1].retained
+    assert stays[2].hotel.id == "stub-H-Ludhiana"
+    assert stays[2].retained
+    assert "practical day trip" in stays[2].reason
+
+
 def test_far_anchor_creates_new_stay_with_reason():
     hotels = [_stub_hotel("H-Amritsar", *AMRITSAR), _stub_hotel("H-Ludhiana", *LUDHIANA)]
     stays, _ = plan_overnight_stays(

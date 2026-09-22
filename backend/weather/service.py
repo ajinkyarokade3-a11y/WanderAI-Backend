@@ -7,6 +7,7 @@ Provider failures raise WeatherProviderError (mapped to 502). Not configured rai
 """
 import time
 import logging
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,16 @@ class WeatherNotConfigured(Exception):
 
 class WeatherProviderError(Exception):
     pass
+
+
+def _redact_key(text: Any) -> str:
+    """Strip credential query params from provider error text.
+
+    httpx embeds the request URL (including ``apikey=...``) in HTTP
+    errors; this content reaches API error responses and server logs, so
+    the key value must never survive here.
+    """
+    return re.sub(r"(api_?key=)[^&\s]*", r"\1[REDACTED]", str(text), flags=re.IGNORECASE)
 
 # Simple TTL cache
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -123,9 +134,9 @@ def fetch_weather(
     except httpx.TimeoutException as e:
         raise WeatherProviderError("Weather provider timed out") from e
     except httpx.HTTPError as e:
-        raise WeatherProviderError(f"Weather provider failed: {e}") from e
+        raise WeatherProviderError(f"Weather provider failed: {_redact_key(e)}") from e
     except Exception as e:
-        raise WeatherProviderError(f"Weather provider failed: {e}") from e
+        raise WeatherProviderError(f"Weather provider failed: {_redact_key(e)}") from e
     try:
         payload = resp.json()
     except Exception as e:

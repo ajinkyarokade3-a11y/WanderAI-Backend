@@ -1,7 +1,7 @@
 """Deterministic, catalog-grounded recommendations for the existing API."""
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,16 @@ from backend.models.models import Activity, Hotel, TransportOption
 
 class RecommendationEngine:
     """Rank active catalog candidates while keeping Gemini supplementary."""
+
+    # Proximity component of the hotel score (added to the existing 100).
+    # Weight 10 matches the smallest existing components, so geography can
+    # decide close calls but never outrank budget + category + rating
+    # combined. Distances use straight-line haversine and decay linearly
+    # to zero at PROXIMITY_SCALE_KM; hotels without coordinates receive
+    # the neutral midpoint so missing data neither helps nor hurts them.
+    PROXIMITY_WEIGHT = 10.0
+    PROXIMITY_SCALE_KM = 200.0
+    PROXIMITY_NEUTRAL = 5.0
 
     def __init__(self, db: Session):
         self.db = db
@@ -52,14 +62,19 @@ class RecommendationEngine:
             activities_query = activities_query.filter(Activity.inventory_source.in_(["catalog", "live"]))
             transport_query = transport_query.filter(TransportOption.inventory_source.in_(["catalog", "live"]))
 
-        ranked_hotels = self._rank_hotels(hotels_query.all(), preferences)[:5]
+        ranked_hotels = self._rank_hotels(
+            hotels_query.all(), preferences, activities_query.all()
+        )[:5]
         # Up to 12 activities so multi-day trips can fill ~2 stops/day;
         # the generator still caps selection by pace slots and budget.
         ranked_activities = self._rank_activities(activities_query.all(), preferences)[:12]
         ranked_transport = self._rank_transport(transport_query.all(), preferences)[:4]
         return {
             "ai_insights": self._ai_insights(preferences, destination_id),
-            "recommended_hotels": [self._hotel_response(hotel, score) for hotel, score in ranked_hotels],
+            "recommended_hotels": [
+                self._hotel_response(hotel, score, proximity_km)
+                for hotel, score, proximity_km in ranked_hotels
+            ],
             "recommended_activities": [
                 self._activity_response(activity, score) for activity, score in ranked_activities
             ],
@@ -72,19 +87,22 @@ class RecommendationEngine:
         self,
         hotels: Sequence[Hotel],
         preferences: Dict[str, Any],
-    ) -> List[Tuple[Hotel, float]]:
+        activities: Optional[Sequence[Any]] = None,
+    ) -> List[Tuple[Hotel, float, Optional[float]]]:
         prices = [self._number(hotel.price_per_night) for hotel in hotels]
         accommodation_types = self._values(preferences, "accommodation_types")
         interests = self._values(preferences, "interests")
         dietary_requirements = self._values(preferences, "dietary_requirements")
         companions = self._values(preferences, "travel_companions")
         special_requests = self._values(preferences, "special_requests")
+        anchor_points = self._anchor_points(activities)
         scored = []
         for hotel in hotels:
             context = self._catalog_text(
                 hotel.name, hotel.category, hotel.description, hotel.amenities, hotel.address
             )
             price_position = self._relative_position(hotel.price_per_night, prices)
+            proximity_score, proximity_km = self._proximity_terms(hotel, anchor_points)
             score = (
                 self._match_score(accommodation_types, [hotel.category], 30)
                 + self._match_score(interests, context, 10)
@@ -94,12 +112,77 @@ class RecommendationEngine:
                 + self._budget_score(preferences.get("budget_tier"), price_position, 15)
                 + self._rating_score(hotel.rating, 15)
                 + self._price_efficiency(price_position, 10)
+                + proximity_score
             )
-            scored.append((hotel, round(score, 2)))
-        return self._sort_scored(
-            scored,
+            scored.append((hotel, round(score, 2), proximity_km))
+        ranked = self._sort_scored(
+            [(hotel, score) for hotel, score, _ in scored],
             lambda hotel: (-self._number(hotel.rating), self._number(hotel.price_per_night), str(hotel.id)),
         )
+        proximity_by_id = {str(hotel.id): proximity_km for hotel, _, proximity_km in scored}
+        return [
+            (hotel, score, proximity_by_id.get(str(hotel.id)))
+            for hotel, score in ranked
+        ]
+
+    @staticmethod
+    def _anchor_points(activities: Optional[Sequence[Any]]) -> List[Tuple[float, float]]:
+        """Valid activity coordinates for proximity scoring.
+
+        Accepts Activity rows, mappings, or raw (lat, lng) pairs. Invalid
+        or missing coordinates are skipped (never invented, never crash).
+        """
+        points: List[Tuple[float, float]] = []
+        for item in activities or []:
+            if isinstance(item, Mapping):
+                raw = (item.get("latitude"), item.get("longitude"))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                raw = (item[0], item[1])
+            else:
+                raw = (getattr(item, "latitude", None), getattr(item, "longitude", None))
+            try:
+                lat = float(raw[0])
+                lng = float(raw[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0:
+                points.append((lat, lng))
+        return points
+
+    def _proximity_terms(
+        self, hotel: Any, anchor_points: Sequence[Tuple[float, float]]
+    ) -> Tuple[float, Optional[float]]:
+        """(proximity score 0..10, average distance km or None).
+
+        Average straight-line distance from the hotel to every valid
+        activity anchor: the better a base a hotel makes, the higher the
+        score. No valid anchors at all -> (0.0, None) so legacy behavior
+        is byte-identical. Hotel without coordinates -> neutral midpoint.
+        """
+        if not anchor_points:
+            return 0.0, None
+        # Deferred import: backend.itinerary imports the generator, which
+        # imports this engine - a top-level import would be circular.
+        from backend.itinerary.hotel_assignment import haversine_km
+
+        try:
+            hotel_lat = float(getattr(hotel, "latitude", None))
+            hotel_lng = float(getattr(hotel, "longitude", None))
+        except (TypeError, ValueError):
+            return self.PROXIMITY_NEUTRAL, None
+        if not (-90.0 <= hotel_lat <= 90.0 and -180.0 <= hotel_lng <= 180.0):
+            return self.PROXIMITY_NEUTRAL, None
+        distances = [
+            haversine_km(hotel_lat, hotel_lng, lat, lng) for lat, lng in anchor_points
+        ]
+        distances = [d for d in distances if d is not None]
+        if not distances:
+            return self.PROXIMITY_NEUTRAL, None
+        average = sum(distances) / len(distances)
+        score = self.PROXIMITY_WEIGHT * max(
+            0.0, 1.0 - average / self.PROXIMITY_SCALE_KM
+        )
+        return round(score, 2), round(average, 1)
 
     def _rank_activities(
         self,
@@ -267,7 +350,9 @@ class RecommendationEngine:
             }
 
     @staticmethod
-    def _hotel_response(hotel: Hotel, score: float) -> Dict[str, Any]:
+    def _hotel_response(
+        hotel: Hotel, score: float, proximity_km: Optional[float] = None
+    ) -> Dict[str, Any]:
         return {
             "id": hotel.id,
             "destination_id": hotel.destination_id,
@@ -287,6 +372,7 @@ class RecommendationEngine:
             "verification_status": hotel.verification_status,
             "discovery_session_id": hotel.discovery_session_id,
             "match_score": score,
+            "proximity_km": proximity_km,
         }
 
     @staticmethod

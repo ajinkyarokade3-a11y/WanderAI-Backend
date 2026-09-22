@@ -1,5 +1,5 @@
 from typing import List, Optional, Any, Dict
-from datetime import datetime
+from datetime import date as date_cls, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from sqlalchemy.orm import Session
 from backend.database.connection import get_db
@@ -213,6 +213,83 @@ def _hotel_option(hotel: Hotel, trip: Trip, badge: str) -> Dict[str, Any]:
             "latitude": hotel.latitude, "longitude": hotel.longitude}
 
 
+def _route_day_summaries(trip: Trip, itinerary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One summary per itinerary day, including days with no activities.
+
+    Reuses only data already present on the serialized rows (per-item
+    ``route_day_summary`` / ``route_warnings`` written by the generator).
+    Nothing is invented: a day without activity items gets status
+    ``"Empty"`` with a factual explanation instead of ``"Valid"``, and
+    days from trips created before route metadata existed carry
+    ``status=None`` with whatever warnings their rows hold.
+    """
+    day_numbers = [row.get("day_number") for row in itinerary
+                   if isinstance(row.get("day_number"), int)]
+    duration = trip.duration_days or 0
+    total_days = max([duration] + day_numbers + [0])
+    summaries = []
+    for day in range(1, total_days + 1):
+        rows = [row for row in itinerary if row.get("day_number") == day]
+        date = None
+        base = trip.start_date
+        if isinstance(base, datetime):
+            base = base.date()
+        if isinstance(base, date_cls):
+            try:
+                date = (base + timedelta(days=day - 1)).isoformat()
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                date = None
+        activity_rows = [row for row in rows if row.get("item_type") == "activity"]
+        hotel_names = [row.get("title") for row in rows
+                       if row.get("item_type") == "hotel" and row.get("title")]
+        warnings: List[str] = []
+        for row in rows:
+            for warning in (row.get("route_warnings") or []):
+                if warning not in warnings:
+                    warnings.append(warning)
+        summary = next(
+            (row.get("route_day_summary") for row in rows
+             if isinstance(row.get("route_day_summary"), dict)),
+            None,
+        )
+        if summary is not None:
+            status = summary.get("status")
+            daily_travel = summary.get("daily_travel_minutes")
+            longest = summary.get("max_one_way_minutes")
+            summary_hotel = summary.get("hotel")
+        else:
+            status, daily_travel, longest = None, None, None
+            summary_hotel = None
+        explanation = None
+        if not activity_rows:
+            status = "Empty"
+            hotel_name = hotel_names[0] if hotel_names else None
+            if hotel_name:
+                explanation = (
+                    f"Overnight stay at {hotel_name} — no sightseeing "
+                    "planned for this day."
+                )
+            else:
+                explanation = "No activities planned for this day."
+        summaries.append({
+            "day": day,
+            "date": date,
+            "activity_count": len(activity_rows),
+            # Authoritative evening stay for the day: the hotel item when
+            # present, else the generator-written day summary (e.g. the
+            # last sightseeing day has no night-N item but the traveler
+            # still woke up in night N-1's stay). Never invented.
+            "hotel": hotel_names[0] if hotel_names else summary_hotel,
+            "overnight_region": (summary or {}).get("overnight_region"),
+            "daily_travel_minutes": daily_travel,
+            "max_one_way_minutes": longest,
+            "status": status,
+            "explanation": explanation,
+            "warnings": warnings,
+        })
+    return summaries
+
+
 def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
     """Serialize the persisted trip plus UI-derived selection fields.
 
@@ -244,16 +321,46 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
             if catalog_images:
                 row["image_url"] = catalog_images[0]
         itinerary.append(row)
+    # Deterministic day/time order for every consumer (UI lists, PDF day
+    # groups): the database returns insertion order, which interleaves
+    # types. Sorting here keeps renderers from reconstructing sequence.
+    itinerary.sort(key=lambda r: (r.get("day_number") or 0,
+                                  r.get("order_index") or 0,
+                                  str(r.get("id") or "")))
     bookings = [{"id": b.id, "trip_id": b.trip_id, "vendor_id": b.vendor_id,
                  "booking_reference": b.booking_reference, "item_type": b.item_type, "item_id": b.item_id,
                  "amount": b.amount, "currency": b.currency, "status": b.status,
                  "payment_status": b.payment_status, "booking_date": b.booking_date.isoformat()} for b in trip.bookings]
+    route_days = _route_day_summaries(trip, itinerary)
     hotel_items = sorted(
         [i for i in trip.itinerary if i.item_type == "hotel" and i.hotel is not None and i.hotel.is_active],
         key=lambda i: (i.day_number, i.order_index),
     )
     selected_accommodation = _hotel_option(hotel_items[0].hotel, trip, "best_match") if hotel_items else None
     selected_id = hotel_items[0].hotel.id if hotel_items else None
+    if selected_accommodation is not None:
+        # The summary stay must agree with the authoritative night-by-night
+        # plan instead of implying the first hotel covers every night:
+        # scope its nights/total to the nights it actually covers.
+        required_nights = max(1, (trip.duration_days or 2) - 1)
+        covered = sorted({i.day_number for i in hotel_items
+                          if i.hotel is not None and i.hotel.id == selected_id})
+        covered_nights = len(covered)
+        if covered_nights < required_nights:
+            selected_accommodation["nights"] = covered_nights
+            selected_accommodation["total_price"] = round(
+                float(selected_accommodation["price_per_night"] or 0)
+                * covered_nights, 2)
+        selected_accommodation["covers_all_nights"] = (
+            covered_nights >= required_nights)
+        # Overnight region of its earliest covered night (same stay plan).
+        selected_accommodation["overnight_region"] = None
+        for item in hotel_items:
+            if item.hotel is not None and item.hotel.id == selected_id:
+                selected_accommodation["overnight_region"] = (
+                    (item.meta_data or {}).get("ui", {}) or {}).get(
+                        "overnight_region")
+                break
     alternatives: List[Dict[str, Any]] = []
     if trip.destination_id:
         query = db.query(Hotel).filter(Hotel.destination_id == trip.destination_id, Hotel.is_active == True)
@@ -272,8 +379,41 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
             else:
                 badge = "best_match"
             alternatives.append(_hotel_option(hotel, trip, badge))
-    daily_accommodations = [{"day_number": item.day_number, "hotel": _hotel_option(item.hotel, trip, "best_match")}
-                            for item in hotel_items]
+    daily_accommodations = []
+    trip_start = trip.start_date
+    if isinstance(trip_start, datetime):
+        trip_start = trip_start.date()
+    if not isinstance(trip_start, date_cls):
+        trip_start = None
+    for item in hotel_items:
+        hotel_view = _hotel_option(item.hotel, trip, "best_match")
+        # Authoritative overnight region + per-night stay cost ride from
+        # the same stay plan that produced this item (never re-derived).
+        hotel_view["overnight_region"] = (
+            (item.meta_data or {}).get("ui", {}) or {}).get("overnight_region")
+        # Sequential-chain dates: night N spans [start+N-1, start+N).
+        # Derived from trip dates only; None when the trip is dateless.
+        hotel_view["check_in_date"] = None
+        hotel_view["check_out_date"] = None
+        if trip_start is not None:
+            try:
+                hotel_view["check_in_date"] = (
+                    trip_start + timedelta(days=item.day_number - 1)).isoformat()
+                hotel_view["check_out_date"] = (
+                    trip_start + timedelta(days=item.day_number)).isoformat()
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                hotel_view["check_in_date"] = None
+                hotel_view["check_out_date"] = None
+        # Evidence/verification status travels with the stay (same row the
+        # assignment chose); never re-graded here.
+        hotel_view["inventory_source"] = item.hotel.inventory_source
+        hotel_view["verification_status"] = item.hotel.verification_status
+        daily_accommodations.append(
+            {"day_number": item.day_number, "hotel": hotel_view,
+             # Authoritative per-night stay cost: summing
+             # stay_cost across nights always equals
+             # cost_breakdown.accommodation.
+             "stay_cost": round(float(item.cost or 0), 2)})
     transport_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "transport")
     accommodation_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "hotel")
     activities_cost = sum(float(i.cost or 0) for i in trip.itinerary if i.item_type == "activity")
@@ -302,6 +442,12 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                             "discovery_session_id": trip.destination.discovery_session_id,
                             "is_featured": trip.destination.is_featured, "created_at": trip.destination.created_at.isoformat()} if trip.destination else None,
             "itinerary": itinerary, "bookings": bookings,
+            "route_days": route_days,
+            # Trip-level notes recorded during generation (e.g. relevant
+            # stops excluded for geographic coherence, plan-level overflow
+            # warnings). Additive; fresh loads default to [].
+            "itinerary_warnings": list(
+                getattr(trip, "_itinerary_warnings", None) or []),
             "total_cost": total_cost, "cost_breakdown": cost_breakdown,
             "selected_accommodation": selected_accommodation,
             "accommodation_alternatives": alternatives,

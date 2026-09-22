@@ -18,6 +18,7 @@ most) one provider call per unique location.
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,16 @@ _TRANSIENT_IMAGE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 class SerpApiImageError(Exception):
     """Raised when the SerpApi image request fails or returns unusable data."""
+
+
+def _redact_key(text: Any) -> str:
+    """Strip credential query params from provider error text.
+
+    httpx embeds the request URL (including ``api_key=...``) in HTTP
+    errors; this content reaches API error responses and server logs, so
+    the key value must never survive here.
+    """
+    return re.sub(r"(api_?key=)[^&\s]*", r"\1[REDACTED]", str(text), flags=re.IGNORECASE)
 
 
 # Hosts that never yield displayable photos: watermarked stock comps and
@@ -186,9 +197,9 @@ def search_serpapi_images(
                 )
                 time.sleep(0.5 * attempt)
                 continue
-            raise SerpApiImageError(f"Image search failed: {exc}") from exc
+            raise SerpApiImageError(f"Image search failed: {_redact_key(exc)}") from exc
         except httpx.HTTPError as exc:
-            raise SerpApiImageError(f"Image search failed: {exc}") from exc
+            raise SerpApiImageError(f"Image search failed: {_redact_key(exc)}") from exc
     assert response is not None  # loop breaks only on success or raise
     try:
         payload = response.json()

@@ -17,6 +17,16 @@ class SerpApiError(Exception):
     """Raised when the SerpApi request fails or returns unusable data."""
 
 
+def _redact_key(text: Any) -> str:
+    """Strip credential query params from provider error text.
+
+    httpx embeds the request URL (including ``api_key=...``) in HTTP
+    errors; this content reaches API error responses and server logs, so
+    the key value must never survive here.
+    """
+    return re.sub(r"(api_?key=)[^&\s]*", r"\1[REDACTED]", str(text), flags=re.IGNORECASE)
+
+
 def _http_get(url: str, params: Dict[str, Any], timeout_s: float) -> httpx.Response:
     return httpx.get(url, params=params, timeout=float(timeout_s))
 
@@ -121,7 +131,7 @@ def search_serpapi_hotels(
     except httpx.TimeoutException as exc:
         raise SerpApiError("Hotel search timed out") from exc
     except httpx.HTTPError as exc:
-        raise SerpApiError(f"Hotel search failed: {exc}") from exc
+        raise SerpApiError(f"Hotel search failed: {_redact_key(exc)}") from exc
     try:
         payload = response.json()
     except ValueError as exc:

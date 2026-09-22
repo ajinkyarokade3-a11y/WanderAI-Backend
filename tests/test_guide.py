@@ -26,6 +26,7 @@ from backend.database.connection import SessionLocal
 from backend.models.models import (
     Booking,
     Destination,
+    GuideConversationSummary,
     GuideMessage,
     ItineraryItem,
     Trip,
@@ -49,6 +50,59 @@ def _no_gemini(monkeypatch):
     monkeypatch.setattr(routes, "gemini_service", _GeminiOff())
 
 
+# Per-test record of rows created by the factory helpers below. Teardown
+# deletes ONLY these primary keys (never title-based matching), FK-safe
+# order, best-effort per table, and always runs - even when the test fails.
+# Nothing created before the fixture started can be touched.
+_created_stack = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_guide_test_rows():
+    record = {"users": [], "trips": []}
+    _created_stack.append(record)
+    try:
+        yield
+    finally:
+        _created_stack.remove(record)
+        _delete_tracked_rows(record)
+
+
+def _track(kind, row_id):
+    if _created_stack and row_id is not None:
+        _created_stack[-1][kind].append(row_id)
+
+
+def _delete_tracked_rows(record):
+    """Delete helper-created rows (and their children) by recorded PKs only."""
+    trip_ids = [i for i in record["trips"] if i is not None]
+    user_ids = [i for i in record["users"] if i is not None]
+    if not trip_ids and not user_ids:
+        return
+    db = SessionLocal()
+    try:
+        steps = [
+            (GuideMessage, GuideMessage.trip_id, trip_ids),
+            (GuideConversationSummary, GuideConversationSummary.trip_id, trip_ids),
+            (Booking, Booking.trip_id, trip_ids),
+            (ItineraryItem, ItineraryItem.trip_id, trip_ids),
+            (TripPreference, TripPreference.trip_id, trip_ids),
+            (Trip, Trip.id, trip_ids),
+            (User, User.id, user_ids),
+        ]
+        for model, column, ids in steps:
+            if not ids:
+                continue
+            try:
+                db.query(model).filter(column.in_(ids)).delete(
+                    synchronize_session=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+    finally:
+        db.close()
+
+
 def _signup(email=None, name="Test Traveler"):
     email = email or f"guide-{uuid.uuid4().hex[:8]}@example.com"
     r = client.post("/api/auth/traveler/signup", json={
@@ -56,6 +110,7 @@ def _signup(email=None, name="Test Traveler"):
     })
     assert r.status_code == 201, r.text
     body = r.json()
+    _track("users", (body.get("user") or {}).get("id"))
     return body["user"], body["token"]
 
 
@@ -85,6 +140,7 @@ def _make_trip(db, user_id, title="Guide Test Trip", dest_slug="manali",
     ))
     db.commit()
     db.refresh(trip)
+    _track("trips", trip.id)
     return trip
 
 

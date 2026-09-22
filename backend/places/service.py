@@ -128,6 +128,51 @@ def fetch_place_images(latitude: float, longitude: float, base_url: str,
     return urls[: max(0, int(limit))]
 
 
+def reverse_geocode(latitude: Any, longitude: Any, base_url: str,
+                      timeout_s: float) -> Optional[Dict[str, Any]]:
+    """Nominatim reverse-geocode to address parts; None when unresolved.
+
+    Returns {"locality": ..., "broader": ..., "display_name": ...} where
+    locality is the most specific city/town/village/hamlet and broader is
+    the county/state-district fallback. Never raises; None means the
+    caller must skip the lookup instead of guessing a place name.
+    """
+    try:
+        lat, lng = float(latitude), float(longitude)
+    except (TypeError, ValueError):
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return None
+    try:
+        response = _http_get(base_url.rstrip("/") + "/reverse",
+                             {"lat": lat, "lon": lng, "format": "json"},
+                             timeout_s)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    address = payload.get("address")
+    if not isinstance(address, dict):
+        return None
+    locality = next(
+        (str(address[key]).strip() for key in
+         ("city", "town", "village", "hamlet", "suburb", "municipality")
+         if str(address.get(key) or "").strip()),
+        "",
+    )
+    broader = next(
+        (str(address[key]).strip() for key in ("county", "state_district")
+         if str(address.get(key) or "").strip()),
+        "",
+    )
+    if not locality and not broader:
+        return None
+    return {"locality": locality, "broader": broader,
+            "display_name": str(payload.get("display_name") or "")}
+
+
 def get_live_places(destination: str, latitude: Any, longitude: Any, limit: int,
                     nominatim_url: str, overpass_url: str, commons_url: str,
                     timeout_s: float, radius_m: int) -> Dict[str, Any]:
