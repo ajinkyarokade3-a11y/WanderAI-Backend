@@ -288,6 +288,110 @@ def test_empty_places_signals_provider_issue(monkeypatch):
         _delete_destination(dest_id)
 
 
+def test_verified_orphan_reused_without_rediscovery(monkeypatch):
+    """A verified orphan from a failed attempt is adopted (same session);
+    no second slow discovery round, no duplicate destination rows."""
+    import uuid as _uuid
+    from backend.dynamic_destination.service import DynamicDestinationDiscoveryService
+    from backend.models.models import Activity, Destination, Hotel, TransportOption
+
+    tag = _uuid.uuid4().hex[:8]
+    base = f"Orphanville {tag}"
+    sess = _uuid.uuid4().hex[:8]
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("discovery must not run when a verified orphan exists")
+
+    monkeypatch.setattr(DynamicDestinationDiscoveryService, "discover_and_persist", _boom)
+    db = SessionLocal()
+    try:
+        dest = Destination(
+            id=f"dst-orphan-{tag}", name=base, slug=f"orphanville-{tag}-{sess}",
+            country="India", state_region=base, description="Orphan test.",
+            inventory_source="discovered", verification_status="verified_candidate",
+            discovery_session_id=sess + "extra16chars!!"[:16],
+            latitude=10.0, longitude=76.0)
+        db.add(dest)
+        db.flush()
+        db.add(Hotel(id=f"htl-orphan-{tag}", destination_id=dest.id, name="Orphan Stay",
+                     price_per_night=5000.0, currency="INR", rating=4.5,
+                     inventory_source="discovered", verification_status="verified_candidate",
+                     discovery_session_id=dest.discovery_session_id, is_active=True))
+        db.add(TransportOption(
+            id=f"trn-orphan-{tag}", destination_id=dest.id, type="private_cab",
+            name="Orphan Cab", route_from="A", route_to="B", duration_hours=2.0,
+            price=2000.0, currency="INR", capacity=6,
+            inventory_source="discovered", verification_status="verified_candidate",
+            discovery_session_id=dest.discovery_session_id, is_active=True))
+        for idx in range(3):
+            db.add(Activity(
+                id=f"act-orphan-{tag}-{idx}", destination_id=dest.id,
+                title=f"Orphan Spot {idx}", category="culture", duration_hours=2.0,
+                price_per_person=500.0, currency="INR", rating=4.5,
+                inventory_source="discovered", verification_status="verified_candidate",
+                discovery_session_id=dest.discovery_session_id, is_active=True))
+        db.commit()
+        dest_id = dest.id
+    finally:
+        db.close()
+    try:
+        db = SessionLocal()
+        before = db.query(Destination).filter(
+            Destination.slug.like(f"orphanville-{tag}-%")).count()
+        db.close()
+        r = client.post("/api/trips", json={
+            "title": "Orphan Adopt Trip", "destination_name": base,
+            "duration_days": 3, "traveler_count": 2,
+            "total_budget": 50000.0, "currency": "INR"})
+        assert r.status_code == 200, r.text
+        assert r.json()["destination"]["id"] == dest_id
+        db = SessionLocal()
+        after = db.query(Destination).filter(
+            Destination.slug.like(f"orphanville-{tag}-%")).count()
+        db.close()
+        assert after == before
+        assert client.delete(f"/api/trips/{r.json()['id']}").status_code == 200
+    finally:
+        _delete_destination(dest_id)
+
+
+def test_commons_name_fallback_and_radius_cap(monkeypatch):
+    """Geotagged misses fall back to name search; radius capped at 10km."""
+    import backend.places.service as places_service
+
+    seen = {}
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, params, timeout, headers=None):
+        seen.update(params)
+        if params.get("generator") == "search":
+            return _Resp({"query": {"pages": {"1": {"imageinfo": [
+                {"thumburl": "https://upload.wikimedia.org/x.jpg"}]}}}})
+        return _Resp({"query": {"pages": {}}})
+
+    monkeypatch.setattr(places_service, "_http_get", _fake_get)
+    assert places_service.fetch_image_for_name(
+        "Assam State Museum", "http://x", 5) == "https://upload.wikimedia.org/x.jpg"
+    assert places_service.fetch_image_for_name("", "http://x", 5) is None
+    monkeypatch.setattr(
+        places_service, "fetch_attractions",
+        lambda *a, **k: [{"name": "Nameless Spot", "latitude": 10.0,
+                          "longitude": 20.0, "kind": "park"}])
+    out = places_service.get_live_places(
+        "Testville", 10.0, 20.0, 2, "http://x", "http://x", "http://x", 5, 30000)
+    assert seen.get("ggsradius") == 10000
+    assert out["places"][0]["image_url"] == "https://upload.wikimedia.org/x.jpg"
+
+
 def test_fill_is_idempotent(_live_providers):
     from backend.live_fill.service import fill_destination_inventory
     dest_id = _make_bare_destination(with_transport=True)

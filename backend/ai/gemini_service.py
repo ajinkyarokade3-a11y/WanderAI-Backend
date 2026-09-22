@@ -214,6 +214,14 @@ class GeminiService:
                 text = text[:-3]
             data = json.loads(text.strip())
             data["source"] = used_model
+            # Backfill machine-extractable facts the model omits (counts,
+            # amounts, durations, explicit destination names) so the
+            # contract holds regardless of provider.
+            heur = self._heuristic_preferences(text_prompt, context)
+            for key in ("detected_destination", "budget_amount",
+                        "budget_currency", "traveler_count", "duration_days"):
+                if data.get(key) is None and heur.get(key) is not None:
+                    data[key] = heur[key]
             return data
         except Exception as e:
             logger.error(f"Gemini preference extraction error: {e}")

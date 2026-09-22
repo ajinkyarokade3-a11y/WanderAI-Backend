@@ -56,6 +56,7 @@ from backend.dynamic_destination.service import DynamicDestinationDiscoveryError
 from backend.itinerary.generator import ItineraryGenerationError, ItineraryGenerator
 from backend.replanning.engine import ReplanningEngine
 import os
+import re
 import secrets
 
 router = APIRouter()
@@ -118,6 +119,36 @@ def _resolve_or_discover_destination(db: Session, trip_in: TripCreate) -> Destin
     destination_name = _requested_destination_name(trip_in)
     if not destination_name:
         raise HTTPException(status_code=422, detail="A valid destination name is required")
+    # Reuse an existing live (session-free) destination by slug: no provider
+    # calls, no duplicate destination rows on repeat visits.
+    slug = re.sub(r"[^a-z0-9]+", "-", destination_name.strip().lower()).strip("-")
+    if slug:
+        live = db.query(Destination).filter(
+            Destination.slug == slug,
+            Destination.inventory_source == "live",
+        ).first()
+        if live is not None:
+            return live
+        # Reuse a verified orphan from a failed attempt (same base slug, no
+        # trips ever attached): instant success instead of another slow,
+        # duplicating discovery round. The new trip adopts its session, so
+        # inventory scoping stays exact.
+        orphan = (
+            db.query(Destination)
+            .filter(
+                Destination.slug.like(f"{slug}-%"),
+                Destination.inventory_source == "discovered",
+                Destination.verification_status == "verified_candidate",
+                ~Destination.id.in_(
+                    db.query(Trip.destination_id).filter(
+                        Trip.destination_id.isnot(None))
+                ),
+            )
+            .order_by(Destination.created_at.desc())
+            .first()
+        )
+        if orphan is not None:
+            return orphan
     try:
         return DynamicDestinationDiscoveryService(db, gemini_service).discover_and_persist(
             trip_in, destination_name, secrets.token_hex(16)

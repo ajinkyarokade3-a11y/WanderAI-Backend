@@ -52,7 +52,77 @@ class ItineraryGenerator:
         existing_items = self._trip_items(trip)
         if existing_items:
             return existing_items
-        return self._persist_ranked_items(trip, [])
+        try:
+            return self._persist_ranked_items(trip, [])
+        except ItineraryGenerationError as exc:
+            raise self._with_budget_hint(trip, exc) from exc
+
+    def _with_budget_hint(self, trip: Trip, exc: ItineraryGenerationError) -> ItineraryGenerationError:
+        """Append the cheapest workable total to budget failures so travelers
+        know by how much to raise the budget (or what to cut) instead of
+        guessing. Non-budget errors pass through untouched."""
+        if "fits the trip budget" not in str(exc):
+            return exc
+        try:
+            estimate = self.minimum_viable_estimate(trip)
+        except Exception:
+            return exc
+        if estimate is None:
+            return exc
+        cur = (trip.currency or "INR").upper()
+        return ItineraryGenerationError(
+            f"{exc} (cheapest workable plan ≈ {cur} {estimate:,.0f} for "
+            f"{max(1, int(trip.traveler_count or 1))} traveler(s), "
+            f"{max(1, int(trip.duration_days or 1))} days — "
+            "raise the budget or shorten the trip)."
+        )
+
+    def minimum_viable_estimate(self, trip: Trip) -> Optional[float]:
+        """Cheapest possible trip total from real inventory, or None when any
+        required piece is missing. Mirrors validator scoping."""
+        if not trip.destination_id:
+            return None
+        currency = (trip.currency or "INR").upper()
+        travelers = max(1, int(trip.traveler_count or 1))
+        duration = max(1, int(trip.duration_days or 1))
+        nights = max(1, duration - 1)
+        required = max(0, duration - 1)
+        session_id = trip.discovery_session_id
+
+        def _scoped(query, model):
+            query = query.filter(
+                model.destination_id == trip.destination_id,
+                model.currency == currency,
+                model.is_active == True,  # noqa: E712
+            )
+            if session_id:
+                return query.filter(
+                    model.inventory_source == "discovered",
+                    model.discovery_session_id == session_id,
+                    model.verification_status == "verified_candidate",
+                )
+            return query.filter(model.inventory_source.in_(["catalog", "live"]))
+
+        hotel_prices = sorted(
+            float(h.price_per_night or 0)
+            for h in _scoped(self.db.query(Hotel), Hotel).all()
+        )
+        if not hotel_prices:
+            return None
+        transport_prices = sorted(
+            float(o.price or 0)
+            for o in _scoped(self.db.query(TransportOption), TransportOption)
+            .filter(TransportOption.capacity >= travelers).all()
+        )
+        act_prices = sorted(
+            float(a.price_per_person or 0) * travelers
+            for a in _scoped(self.db.query(Activity), Activity).all()
+        )
+        if len(act_prices) < required:
+            return None
+        return (hotel_prices[0] * nights
+                + (transport_prices[0] if transport_prices else 0.0)
+                + sum(act_prices[:required]))
 
     def optimize_for_trip(self, trip_id: str) -> List[ItineraryItem]:
         """Replace proposed catalog selections with a budget-bounded ranked selection."""
@@ -71,7 +141,10 @@ class ItineraryGenerator:
         if replaceable:
             self.db.flush()
 
-        new_items = self._persist_ranked_items(trip, preserved_items, commit=False)
+        try:
+            new_items = self._persist_ranked_items(trip, preserved_items, commit=False)
+        except ItineraryGenerationError as exc:
+            raise self._with_budget_hint(trip, exc) from exc
         self.db.commit()
         return self._sorted_items([*preserved_items, *new_items])
 
@@ -1229,6 +1302,71 @@ class ItineraryGenerator:
                     break
             if placed:
                 spilled = [(a, d) for (a, d) in spilled if a != aid]
+
+        # Swap pass: exchange an unrestored long stop with a short scheduled
+        # stop elsewhere when both fit better swapped (e.g. a 7h hike moves
+        # to a morning, a short stroll takes the evening). Same travel
+        # budgets and caps as the move pass; counts per day never change.
+        # Trial days are ordered longest-first so the long stop actually
+        # lands on a morning floor instead of inheriting another evening.
+        def _longest_first(aids):
+            def _dur(a):
+                try:
+                    return -float(meta[a][1] or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            return sorted(aids, key=_dur)
+
+        for aid, from_day in list(spilled):
+            if aid not in [a for (a, d) in spilled]:
+                continue
+            try:
+                need = float(meta[aid][1] or 0)
+            except (TypeError, ValueError):
+                continue
+            swapped = False
+            for target in sorted(scheduled):
+                if target == from_day:
+                    continue
+                for (cand, _, _) in list(scheduled[target]):
+                    try:
+                        cand_need = float(meta[cand][1] or 0)
+                    except (TypeError, ValueError):
+                        cand_need = 0.0
+                    if cand_need >= need:
+                        continue  # only trade down in duration
+                    trial_target = _longest_first(
+                        [a for (a, _, _) in scheduled[target] if a != cand] + [aid])
+                    near = nearest_minutes(aid, [a for (a, _, _) in scheduled[target] if a != cand])
+                    if near is None or near > max_one_way:
+                        continue
+                    if day_travel_for(trial_target) is not None and day_travel_for(trial_target) > max_daily:
+                        continue
+                    resched_t, out_t = schedule_day_stops(
+                        [(a, meta[a][0], meta[a][1]) for a in trial_target],
+                        template_floors(target, len(trial_target)),
+                        list(blockers.get(target, [])),
+                        day_start_floor=arrival_floor if target == 1 else day_start,
+                        day_end=day_end, speed_kmh=speed, buffer_min=buffer_min)
+                    if out_t:
+                        continue
+                    trial_from = _longest_first(
+                        [a for (a, _, _) in scheduled[from_day] if a != aid] + [cand])
+                    resched_f, out_f = schedule_day_stops(
+                        [(a, meta[a][0], meta[a][1]) for a in trial_from],
+                        template_floors(from_day, len(trial_from)),
+                        list(blockers.get(from_day, [])),
+                        day_start_floor=arrival_floor if from_day == 1 else day_start,
+                        day_end=day_end, speed_kmh=speed, buffer_min=buffer_min)
+                    if out_f:
+                        continue
+                    scheduled[target] = resched_t
+                    scheduled[from_day] = resched_f
+                    spilled = [(a, d) for (a, d) in spilled if a != aid]
+                    swapped = True
+                    break
+                if swapped:
+                    break
 
         # Anything still spilled keeps its original day with honest,
         # duration-aware times placed after the day's last stop (never
