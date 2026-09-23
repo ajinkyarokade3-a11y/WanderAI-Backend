@@ -448,6 +448,9 @@ def _replanning_test_trip():
     user = db.query(User).first()
     destination = db.query(Destination).filter(Destination.slug == "manali").first()
     activity = db.query(Activity).filter(Activity.id == "act-manali-001").first()
+    assert user is not None
+    assert destination is not None
+    assert activity is not None
     trip = Trip(user_id=user.id, destination_id=destination.id, title="Catalog replan test", traveler_count=2)
     db.add(trip)
     db.flush()

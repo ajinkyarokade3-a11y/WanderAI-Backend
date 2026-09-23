@@ -16,6 +16,49 @@ class Settings(BaseSettings):
     BACKEND_PORT: int = 8000
     DATABASE_URL: str
     GEMINI_API_KEY: str = ""
+    # ------------------------------------------------------------------
+    # AI failover hierarchy: Provider -> API Key -> Model (sequential).
+    # Provider priority is fixed: Gemini (1) -> OpenRouter (2) -> Grok (3).
+    # No secrets are hardcoded; every credential comes from the environment.
+    # Model lists are CSV strings so they can change without touching code.
+    # ------------------------------------------------------------------
+    # Gemini (priority 1). GEMINI_API_KEY is kept as a legacy alias for key 1.
+    GEMINI_API_KEY_1: str = ""
+    GEMINI_API_KEY_2: str = ""
+    GEMINI_API_KEY_3: str = ""
+    GEMINI_MODELS: str = "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3.5-flash"
+    GEMINI_ENABLED: bool = True
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
+    # OpenRouter (priority 2, OpenAI-compatible). IDs verified Sep 2026 from
+    # https://openrouter.ai/collections/free-models and the live :free catalog;
+    # the free roster churns, so override via env without code changes.
+    OPENROUTER_API_KEY_1: str = ""
+    OPENROUTER_API_KEY_2: str = ""
+    OPENROUTER_API_KEY_3: str = ""
+    OPENROUTER_MODELS: str = "openai/gpt-oss-20b:free,google/gemma-4-31b-it:free,nvidia/nemotron-3-nano-30b-a3b:free,cohere/north-mini-code:free"
+    OPENROUTER_ENABLED: bool = True
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # Grok / xAI (priority 3, OpenAI-compatible Chat Completions, which xAI
+    # still serves alongside the newer Responses API). xAI has no $0 tier;
+    # defaults are documented IDs from https://docs.x.ai/developers/models
+    # (Sep 2026); primary grok-4.3 is on the standard-API pricing page.
+    GROK_API_KEY_1: str = ""
+    GROK_API_KEY_2: str = ""
+    GROK_API_KEY_3: str = ""
+    GROK_MODELS: str = "grok-4.3,grok-code-fast-1,grok-4-1-fast-reasoning"
+    GROK_ENABLED: bool = True
+    GROK_BASE_URL: str = "https://api.x.ai/v1"
+    # Shared failover resilience tuning (router reads these; no logic here).
+    AI_MODEL_COOLDOWN_S: float = 300.0
+    AI_KEY_COOLDOWN_S: float = 600.0
+    AI_PROVIDER_COOLDOWN_S: float = 900.0
+    # Long-window skip for provider-rejected keys (INVALID_API_KEY). Still a
+    # cooldown, never permanent: expiry re-enables the key automatically.
+    AI_KEY_DISABLE_S: float = 3600.0
+    AI_REQUEST_TIMEOUT_S: float = 30.0
+    AI_MAX_TRANSIENT_RETRIES: int = 1
+    AI_INITIAL_BACKOFF_MS: int = 1000
+    AI_MAX_BACKOFF_MS: int = 10000
     # Live hotel search (SerpApi Google Hotels, backend-only). Empty key
     # disables live search; endpoints then report provider-unavailable.
     SERPAPI_API_KEY: str = ""
