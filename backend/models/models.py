@@ -214,6 +214,7 @@ class Trip(Base):
     currency = Column(String(10), default="INR")
     traveler_count = Column(Integer, default=2)
     pace = Column(String(50), default="balanced")  # relaxed, balanced, packed
+    origin = Column(String(255), nullable=True)  # traveler starting city (free text, never invented)
     discovery_session_id = Column(String(64), nullable=True, index=True)
     # Full Express canonical trip object (JSON) for traveler-owned persistence.
     # The Express engine remains the itinerary generator; this snapshot is the

@@ -224,6 +224,8 @@ class TravelerTripSummary(BaseModel):
     status: str = "planning"
     updated_at: Optional[str] = None
     traveler_profile: Optional[TravelerProfileRead] = None
+    # Starting city persisted on the trip (null on older snapshots).
+    origin: Optional[str] = None
     # Enrichment for trip-history cards. All optional and sourced from the
     # saved snapshot/row — never fabricated. Older snapshots simply omit them.
     total_budget: Optional[float] = None
@@ -341,6 +343,8 @@ class TransportRead(TransportBase):
     model_config = ConfigDict(from_attributes=True)
     id: str
     created_at: datetime
+    # Resolved operator name for display; null when no vendor is attached.
+    provider_name: Optional[str] = None
 
 # Live places/attractions (normalized Overpass + Commons data)
 class LivePlace(BaseModel):
@@ -645,6 +649,12 @@ class TripCreate(TripBase):
     origin: Optional[str] = None
     travel_type: Optional[str] = None
     formatted_dates: Optional[str] = None
+    # Legacy explicit transport selection (catalog id). Current clients no
+    # longer send one pre-generation: after the traveler confirms Origin +
+    # Destination + Dates + Travelers, the backend researches transfers live
+    # and Gemini analyzes them before the itinerary is generated. Still
+    # validated strictly when supplied; never silently substituted.
+    transport_id: Optional[str] = None
 
 class TripUpdate(BaseModel):
     title: Optional[str] = None

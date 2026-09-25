@@ -55,9 +55,12 @@ from backend.recommendation.engine import RecommendationEngine
 from backend.dynamic_destination.service import DynamicDestinationDiscoveryError, DynamicDestinationDiscoveryService
 from backend.itinerary.generator import ItineraryGenerationError, ItineraryGenerator
 from backend.replanning.engine import ReplanningEngine
+import logging
 import os
 import re
 import secrets
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -458,7 +461,7 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
             "title": trip.title, "status": trip.status, "start_date": trip.start_date.isoformat() if trip.start_date else None,
             "end_date": trip.end_date.isoformat() if trip.end_date else None, "duration_days": trip.duration_days,
             "total_budget": trip.total_budget, "currency": trip.currency, "traveler_count": trip.traveler_count,
-            "pace": trip.pace, "discovery_session_id": trip.discovery_session_id,
+            "pace": trip.pace, "origin": trip.origin, "discovery_session_id": trip.discovery_session_id,
             "confirmed_at": trip.confirmed_at.isoformat() if trip.confirmed_at else None,
             "confirmed_by": trip.confirmed_by,
             "created_at": trip.created_at.isoformat(), "updated_at": trip.updated_at.isoformat(),
@@ -1423,16 +1426,44 @@ def get_activities(
 @router.get("/transport", response_model=List[TransportRead])
 def get_transport_options(
     destination_id: Optional[str] = None,
+    destination: Optional[str] = None,
+    origin: Optional[str] = None,
     type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Retrieve transport options with optional filters."""
+    """Retrieve transport options with optional filters.
+
+    `destination` accepts a catalog name/slug (unknown names yield an empty
+    list, never an error); `origin` substring-matches `route_from`
+    (LIKE-escaped). Only active rows are returned; prices, routes, durations
+    and providers come straight from verified rows — nothing is fabricated.
+    """
     query = db.query(TransportOption).filter(TransportOption.is_active == True)
     if destination_id:
         query = query.filter(TransportOption.destination_id == destination_id)
+    if destination and destination.strip():
+        wanted = destination.strip()
+        dest = db.query(Destination).filter(
+            (Destination.name.ilike(wanted)) | (Destination.slug.ilike(wanted))
+        ).first()
+        if not dest:
+            return []
+        query = query.filter(TransportOption.destination_id == dest.id)
+    if origin and origin.strip():
+        like = _escape_like(origin.strip())
+        query = query.filter(TransportOption.route_from.ilike(f"%{like}%", escape="\\"))
     if type:
         query = query.filter(TransportOption.type == type)
-    return query.all()
+    options = query.all()
+    for option in options:
+        vendor = option.vendor if hasattr(option, "vendor") else None
+        option.provider_name = getattr(vendor, "name", None)
+    return options
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so free-text search stays literal."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 # ----------------------------------------------------
 # Trips API (The Central Entity)
@@ -1491,9 +1522,9 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
     except HTTPException as exc:
         # Curated catalog has gaps: complete them from configured live
         # providers (SerpApi hotels, OSM/Wikimedia places) and re-check.
-        # Transport has no live provider and is traveler-arranged, so its
-        # absence no longer blocks creation. Without a SerpApi key, hotels
-        # cannot be filled, so the original error stands as well.
+        # Transport absence never blocks creation — it is researched live
+        # below and otherwise stays traveler-arranged. Without a SerpApi
+        # key, hotels cannot be filled, so the original error stands.
         if exc.status_code != 422 or not (settings.SERPAPI_API_KEY or "").strip():
             raise
         from backend.live_fill.service import fill_destination_inventory
@@ -1517,6 +1548,50 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
                                     detail=f"{retry_exc.detail}{hint}")
             raise
 
+    # 2a. Live transportation research (post-requirements, never onboarding):
+    # the traveler confirmed Origin + Destination + Dates + Travelers above,
+    # so research real transfer options for that pair now, let Gemini
+    # analyze them, and persist the ranked rows for the itinerary generator
+    # (which auto-picks the best affordable transfer into Day 1). Best
+    # effort — research failures never block trip creation; the itinerary
+    # simply carries no pre-booked transfer items.
+    origin_clean = (trip_in.origin or "").strip() or None
+    if origin_clean:
+        try:
+            from backend.transportation.live_research import research_live_transport_options
+
+            prefs_dump = trip_in.preferences.model_dump() if trip_in.preferences else {}
+            research_live_transport_options(
+                db, destination, origin_clean,
+                traveler_count=traveler_count, currency=currency,
+                start_date=trip_in.start_date, end_date=trip_in.end_date,
+                duration_days=duration_days, total_budget=trip_in.total_budget,
+                preferences=prefs_dump, gemini_service=gemini_service,
+            )
+        except Exception as exc:
+            logger.warning("Live transport research skipped for %s -> %s: %s",
+                           origin_clean, destination.name, exc)
+
+    # 2b. Traveler-selected transport (legacy explicit transport_id only;
+    # current clients no longer send one pre-generation — research above
+    # supplies the transfer instead): validate it strictly against the
+    # resolved destination. Never silently substitute another option.
+    selected_transport = None
+    if trip_in.transport_id:
+        selected_transport = db.query(TransportOption).filter(
+            TransportOption.id == trip_in.transport_id,
+            TransportOption.is_active == True,
+        ).first()
+        if not selected_transport:
+            raise HTTPException(status_code=422, detail="Selected transport option not found")
+        if selected_transport.destination_id != destination.id:
+            raise HTTPException(status_code=422, detail="Selected transport does not serve the trip destination")
+        if (selected_transport.capacity or 0) < max(1, traveler_count):
+            raise HTTPException(status_code=422, detail="Selected transport does not fit the traveler count")
+        option_currency = (selected_transport.currency or "").upper()
+        if option_currency and option_currency != currency.upper():
+            raise HTTPException(status_code=422, detail="Selected transport currency does not match the trip currency")
+
     # 3. Create Trip entity
     trip = Trip(
         user_id=user_id,
@@ -1530,11 +1605,36 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
         currency=currency,
         traveler_count=traveler_count,
         pace=trip_in.pace or "balanced",
+        origin=(trip_in.origin or "").strip() or None,
         discovery_session_id=destination.discovery_session_id if destination.inventory_source == "discovered" else None
     )
     db.add(trip)
     db.commit()
     db.refresh(trip)
+
+    # 3b. Persist the selection as a proposed day-1 transfer carrying the real
+    # catalog row. The generator treats preserved transport as authoritative
+    # (skips auto-pick, counts its cost, blocks its time slot), so the final
+    # itinerary honors the selection's content and timing.
+    if selected_transport is not None:
+        ui_meta = ItineraryGenerator._entity_ui_meta(selected_transport)
+        db.add(ItineraryItem(
+            trip_id=trip.id,
+            day_number=1,
+            order_index=1,
+            item_type="transport",
+            title=selected_transport.name,
+            description=f"{selected_transport.route_from} to {selected_transport.route_to}",
+            start_time="09:30 AM",
+            end_time="01:00 PM",
+            cost=float(selected_transport.price or 0),
+            status="proposed",
+            transport_id=selected_transport.id,
+            location=selected_transport.route_to,
+            meta_data={"ui": ui_meta},
+        ))
+        db.commit()
+        db.refresh(trip)
 
     # 3. Create Preferences
     prefs_in = trip_in.preferences

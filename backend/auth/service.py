@@ -212,6 +212,7 @@ def _snapshot_summary(row: Trip) -> Dict[str, Any]:
         "formatted_dates": snap.get("formatted_dates"),
         "duration_days": snap.get("duration_days") or row.duration_days,
         "status": snap.get("status") or row.status,
+        "origin": snap.get("origin") if isinstance(snap.get("origin"), str) else None,
         "updated_at": (
             row.updated_at.isoformat()
             if getattr(row, "updated_at", None)

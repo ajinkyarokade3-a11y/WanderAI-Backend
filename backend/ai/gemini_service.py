@@ -316,6 +316,50 @@ Return this exact object shape:
                 logger.warning("Destination inventory research model %s failed: %s", model, exc)
         raise RuntimeError("Gemini destination inventory research failed") from last_error
 
+    def analyze_transport_options(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze researched transfer modes for an origin->destination pair.
+
+        Called after the traveler confirms Destination, Origin, Travelers,
+        Dates, Budget, and Other preferences (never during onboarding): the
+        caller supplies deterministic mode estimates plus traveler
+        constraints, and Gemini ranks which real modes suit this party best.
+        Returns ``{"ranked_options": [{type, recommendation_reason,
+        matched_preferences, suitability_score}], "summary": str}``. Raises
+        RuntimeError when Gemini is unavailable so callers fall back to the
+        distance-based ranking instead of blocking trip creation.
+        """
+        if not self.is_available() or not self.client:
+            raise RuntimeError("Gemini is unavailable")
+        prompt = f"""
+You are TourFlow AI's transportation analyst for Indian travel.
+Return ONLY valid JSON. Rank the supplied researched transfer modes for this
+party — never invent new operators, bookings, availability, schedules, or
+prices. Use the given estimates as-is; only rank them and explain why each
+suits (or doesn't suit) the travelers, dates, and budget.
+Trip context: {json.dumps(context)}
+Return this exact object shape:
+{{"ranked_options": [{{"type": "string", "recommendation_reason": "string", "matched_preferences": ["string"], "suitability_score": 0.0}}], "summary": "string"}}
+"""
+        last_error = None
+        for model in GEMINI_MODEL_FALLBACKS:
+            try:
+                response = self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json", "temperature": 0.2},
+                )
+                text = (response.text or "").strip()
+                if text:
+                    payload = json.loads(text)
+                    ranked = payload.get("ranked_options") if isinstance(payload, dict) else None
+                    if isinstance(ranked, list) and ranked:
+                        return {"ranked_options": ranked,
+                                "summary": str(payload.get("summary") or "")}
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Transport analysis model %s failed: %s", model, exc)
+        raise RuntimeError("Gemini transport analysis failed") from last_error
+
     def generate_full_trip_plan(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Generate a complete structured trip plan strictly adhering to the TourFlow AI schema:

@@ -32,6 +32,11 @@ class DynamicDestinationDiscoveryService:
     def discover_and_persist(self, trip_in: Any, destination_name: str, discovery_session_id: str) -> Destination:
         base_request = {
             "destination": destination_name,
+            # Steer research toward the traveler's real starting city so
+            # researched transport carries genuine origin routes. The research
+            # client echoes unknown keys into its prompt; absent origin simply
+            # omits the hint (never a default city).
+            "origin": (trip_in.origin or "").strip() or None,
             "duration_days": int(trip_in.duration_days or 4),
             "budget": float(trip_in.total_budget or 50000.0),
             "currency": (trip_in.currency or "INR").upper(),

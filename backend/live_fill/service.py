@@ -6,8 +6,11 @@ REAL data so trip creation can proceed instead of failing. Persisted rows
 are marked inventory_source="live" / verification_status="live_provider"
 so they never mix with curated catalog data or Gemini discovery sessions.
 
-Transport has no live provider and cannot be filled; trips simply carry
-no pre-booked transfer items when transport inventory is absent.
+Transport is researched separately (backend/transportation/live_research:
+origin->destination modes + Gemini analysis) right after the traveler
+confirms Origin + Destination + Dates + Travelers — never during
+onboarding. Trips without any transfer inventory simply carry no
+pre-booked transfer items.
 
 Never raises: provider failures only reduce what gets filled.
 """
