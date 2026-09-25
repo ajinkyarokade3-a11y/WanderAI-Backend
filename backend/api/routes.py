@@ -358,6 +358,16 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                 catalog_images = None
             if catalog_images:
                 row["image_url"] = catalog_images[0]
+        # Last fallback (places only): the destination-level photo. Used
+        # solely when no specific place photo exists — never preferred over
+        # a real place image. Transport/notes stay imageless by design.
+        if not row.get("image_url") and item.item_type in ("hotel", "activity", "meal"):
+            try:
+                hero = getattr(getattr(trip, "destination", None), "hero_image_url", None)
+                if isinstance(hero, str) and hero.strip():
+                    row["image_url"] = hero.strip()
+            except Exception:
+                pass
         itinerary.append(row)
     # Deterministic day/time order for every consumer (UI lists, PDF day
     # groups): the database returns insertion order, which interleaves
@@ -2444,7 +2454,49 @@ def _change_accommodation(trip_id: str, payload: Dict[str, Any], db: Session, da
             targets = [item]
     for item in targets:
         item.hotel_id, item.title, item.description, item.location, item.cost, item.status = hotel.id, hotel.name, hotel.description, hotel.address, hotel.price_per_night, "confirmed"
+        # Keep the photo relevant to the NEW stay: refresh from its catalog
+        # row, else one provider photo for the new place (never raises).
+        try:
+            meta = dict(item.meta_data or {})
+            ui = dict(meta.get("ui", {}) or {})
+            ui.pop("image_url", None)
+            row_images = getattr(hotel, "images", None) or []
+            if row_images:
+                ui["image_url"] = row_images[0]
+            meta["ui"] = ui
+            item.meta_data = meta
+            if not ui.get("image_url"):
+                _backfill_item_image(item, _destination_name(trip))
+        except Exception:
+            pass
     return _commit_trip(db, trip, "hotel_changed", "hotel", hotel.name, "Traveler selected a catalog hotel.")
+
+
+def _backfill_item_image(item: Any, destination_name: Optional[str]) -> None:
+    """One relevant provider photo for a single imageless place item.
+
+    At most one SerpApi call (per-query cache makes repeats free); never
+    raises — without a key or on provider failure the item keeps no photo
+    and the read path falls back to the destination-level image.
+    """
+    try:
+        from backend.images.service import backfill_missing_place_images
+
+        backfill_missing_place_images(
+            [item], destination_name,
+            settings.SERPAPI_API_KEY or "", settings.SERPAPI_BASE_URL,
+            max_calls=1,
+        )
+    except Exception:
+        pass
+
+
+def _destination_name(trip: Any) -> Optional[str]:
+    try:
+        name = getattr(getattr(trip, "destination", None), "name", None)
+        return str(name).strip() or None
+    except Exception:
+        return None
 
 
 @router.post("/trips/{trip_id}/change-accommodation")
@@ -2481,14 +2533,22 @@ def select_hotel(trip_id: str, selection: SelectHotelRequest, db: Session = Depe
     item.location = selection.location
     item.cost = float(total or 0)
     item.status = "confirmed"
+    # The serializer reads the photo from meta_data.ui (hotel_id is None, so
+    # the catalog fallback cannot apply) — mirror the provider photo there.
+    ui_meta: Dict[str, Any] = {}
+    if isinstance(selection.image_url, str) and selection.image_url.strip():
+        ui_meta["image_url"] = selection.image_url.strip()
     item.meta_data = {"provider": "serpapi", "property_token": selection.property_token,
                       "name": selection.name, "location": selection.location,
                       "image_url": selection.image_url, "description": selection.description,
+                      "ui": ui_meta,
                       "price_per_night": selection.price_per_night, "total_price": total,
                       "currency": (selection.currency or trip.currency or "INR").upper(),
                       "rating": selection.rating, "hotel_class": selection.hotel_class,
                       "amenities": selection.amenities or [],
                       "check_in_date": selection.check_in_date, "check_out_date": selection.check_out_date}
+    if not ui_meta.get("image_url"):
+        _backfill_item_image(item, _destination_name(trip))
     return _commit_trip(db, trip, "hotel_selected", "hotel", selection.name,
                         "Traveler selected a live hotel search result.")
 
@@ -2507,6 +2567,8 @@ def add_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: S
         location=payload.get("location"), status="confirmed",
         meta_data={"ui": {k: payload[k] for k in ("image_url", "duration", "walking_intensity", "rest_buffer_minutes") if k in payload}})
     db.add(item)
+    if not payload.get("image_url"):
+        _backfill_item_image(item, _destination_name(trip))
     return _commit_trip(db, trip, "item_added", "itinerary", title, "Traveler added a custom itinerary activity.")
 
 
@@ -2530,6 +2592,19 @@ def swap_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: 
         if payload.get(f"new_{field}") is not None: setattr(item, field, payload[f"new_{field}"])
     if payload.get("new_image_url"):
         item.meta_data = {**(item.meta_data or {}), "ui": {**(item.meta_data or {}).get("ui", {}), "image_url": payload["new_image_url"]}}
+    else:
+        # A swapped-in place with no catalog photo still deserves one. When
+        # the title changed, the old photo depicts the previous place, so it
+        # is dropped first — the backfill query uses the NEW title, keeping
+        # the displayed photo relevant to what is displayed.
+        meta = dict(item.meta_data or {})
+        ui = dict(meta.get("ui", {}) or {})
+        if payload.get("new_title"):
+            ui.pop("image_url", None)
+            meta["ui"] = ui
+            item.meta_data = meta
+        if not (isinstance(ui.get("image_url"), str) and ui["image_url"].strip()):
+            _backfill_item_image(item, _destination_name(trip))
     return _commit_trip(db, trip, "activity_swapped", "itinerary", item.title, "Traveler swapped an itinerary activity.")
 
 
@@ -2626,6 +2701,8 @@ def add_restaurant(trip_id: str, payload: AddRestaurantRequest, request: Request
         meta_data=meta,
     )
     db.add(item)
+    if not payload.image_url:
+        _backfill_item_image(item, _destination_name(trip))
     db.flush()
     _record_change(db, trip, "restaurant_added", "itinerary", payload.name.strip(), f"Restaurant added to day {payload.day_number} as meal.", "user")
     db.commit()

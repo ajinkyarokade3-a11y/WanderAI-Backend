@@ -158,6 +158,24 @@ class ItineraryGenerator:
         new_items = self._ranked_items(trip, preserved_items)
         if not new_items:
             raise ItineraryGenerationError("No catalog-backed itinerary items could be generated")
+        # Place-photo backfill: hotel/activity items whose catalog row has no
+        # image (live SerpApi/OSM fills often lack one) get one relevant
+        # provider photo, persisted on meta_data.ui so later reads never
+        # re-query. Transport/notes are not places and are skipped.
+        try:
+            from backend.database.config import settings
+            from backend.images.service import backfill_missing_place_images
+
+            destination = getattr(trip, "destination", None)
+            backfill_missing_place_images(
+                new_items,
+                getattr(destination, "name", None),
+                settings.SERPAPI_API_KEY or "",
+                settings.SERPAPI_BASE_URL,
+            )
+        except Exception as exc:
+            logger.warning("Place image backfill skipped for trip %s: %s",
+                           getattr(trip, "id", "?"), exc)
         self.db.add_all(new_items)
         if commit:
             self.db.commit()

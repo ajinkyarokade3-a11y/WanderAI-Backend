@@ -218,6 +218,82 @@ def search_serpapi_images(
     return normalized[: max(1, min(int(max_results or 3), 10))]
 
 
+# Item types that depict a real place and therefore deserve a photo.
+# Transport transfers, departure notes and free-time placeholders carry no
+# place identity — they render as detail cards and must never trigger a
+# provider lookup.
+PLACE_ITEM_TYPES = frozenset({"hotel", "activity", "meal"})
+
+
+def backfill_missing_place_images(
+    items: Any,
+    destination_name: Optional[str],
+    api_key: str = "",
+    base_url: str = "https://serpapi.com",
+    timeout_s: float = 10.0,
+    max_calls: int = 10,
+) -> int:
+    """Fill missing ``ui.image_url`` on place-type itinerary items.
+
+    Each imageless hotel/activity/meal item gets one relevance-ranked photo
+    from the SerpApi Google Images provider (query: "<place>, <destination>").
+    Results persist on the item's ``meta_data.ui`` so the provider is hit at
+    most once per unique place — repeat reads serve the stored URL.
+
+    Bounded (``max_calls`` unique provider calls) and never raises: without a
+    key, on provider failure, or when nothing real is found the item simply
+    keeps no photo and callers fall back to the destination-level image.
+    Returns the number of items that gained a photo.
+    """
+    try:
+        rows = list(items or [])
+    except TypeError:
+        return 0
+    if not rows or not (api_key or "").strip():
+        return 0
+    filled = 0
+    calls = 0
+    resolved: dict = {}
+    for item in rows:
+        try:
+            if getattr(item, "item_type", None) not in PLACE_ITEM_TYPES:
+                continue
+            meta = getattr(item, "meta_data", None) or {}
+            ui = meta.get("ui", {}) if isinstance(meta, dict) else {}
+            ui = ui if isinstance(ui, dict) else {}
+            if isinstance(ui.get("image_url"), str) and ui["image_url"].strip():
+                continue
+            title = str(getattr(item, "title", "") or "").strip()
+            if not title:
+                continue
+            query_key = f"{title.casefold()}|{(destination_name or '').strip().casefold()}"
+            if query_key in resolved:
+                # Same place seen before in this batch: reuse its photo
+                # without another provider call.
+                url = resolved[query_key]
+            else:
+                url = None
+                if calls < max(0, int(max_calls or 0)):
+                    calls += 1
+                    images = get_real_images_for_location(
+                        title, (destination_name or "").strip() or None,
+                        api_key, base_url, timeout_s, count=1,
+                    )
+                    url = images[0] if images else None
+                resolved[query_key] = url
+            if not url:
+                continue
+            item.meta_data = {**(meta if isinstance(meta, dict) else {}),
+                              "ui": {**ui, "image_url": url}}
+            filled += 1
+        except Exception as exc:
+            logger.warning("Place image backfill skipped for %r: %s",
+                           getattr(item, "title", "?"), exc)
+    if filled:
+        logger.info("Place image backfill: %d photo(s) for %r", filled, destination_name)
+    return filled
+
+
 def get_real_image_for_location(
     location: str,
     destination: Optional[str] = None,
