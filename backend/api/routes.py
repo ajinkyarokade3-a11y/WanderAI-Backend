@@ -338,7 +338,11 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                "description": item.description, "start_time": item.start_time, "end_time": item.end_time,
                "cost": item.cost, "status": item.status, "hotel_id": item.hotel_id,
                "activity_id": item.activity_id, "transport_id": item.transport_id,
-               "location": item.location, "meta_data": item.meta_data or {}}
+               "location": item.location, "meta_data": item.meta_data or {},
+               # Real operator/schedule snapshot for transport items (None
+               # otherwise): the UI renders details + booking link from this.
+               "transport_details": ((item.meta_data or {}).get("transport_details")
+                                     if item.item_type == "transport" else None)}
         row.update((item.meta_data or {}).get("ui", {}))
         # Image fallback: resolve from the linked catalog row so every
         # hotel/activity stop renders a photo even when the stored item
@@ -1617,6 +1621,8 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
     # (skips auto-pick, counts its cost, blocks its time slot), so the final
     # itinerary honors the selection's content and timing.
     if selected_transport is not None:
+        from backend.transportation.details import transport_details_snapshot
+
         ui_meta = ItineraryGenerator._entity_ui_meta(selected_transport)
         db.add(ItineraryItem(
             trip_id=trip.id,
@@ -1631,7 +1637,8 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
             status="proposed",
             transport_id=selected_transport.id,
             location=selected_transport.route_to,
-            meta_data={"ui": ui_meta},
+            meta_data={"ui": ui_meta,
+                       "transport_details": transport_details_snapshot(selected_transport)},
         ))
         db.commit()
         db.refresh(trip)
@@ -2321,8 +2328,66 @@ def _commit_trip(db: Session, trip: Trip, action: str, field: str, value: str, r
     return _trip_dict(trip, db)
 
 
+@router.get("/trips/{trip_id}/transport-options", response_model=List[TransportRead])
+def get_trip_transport_options(trip_id: str, db: Session = Depends(get_db)):
+    """Verified transfer options for THIS trip's exact destination row.
+
+    Contract fix: the generic ``GET /transport`` listing resolves
+    destinations by NAME, which is ambiguous when duplicate-name rows exist
+    (discovered/live research mints one row per session) — displayed IDs
+    then fail ``change-transport``'s trip-scoped validation with
+    ``400 Transport option not found``. This endpoint lists options for the
+    trip's own ``destination_id`` with its origin pre-applied, so every
+    returned ID is guaranteed selectable via ``change-transport``.
+    International pairs list flight modes only (surface modes cannot cross
+    borders). An empty list (never an error) means no verified transfer
+    covers the route yet.
+    """
+    from backend.transportation.live_research import is_international_route
+
+    trip = _trip_or_404(db, trip_id)
+    query = db.query(TransportOption).filter(
+        TransportOption.destination_id == trip.destination_id,
+        TransportOption.is_active == True,
+    )
+    if trip.origin and trip.origin.strip():
+        like = _escape_like(trip.origin.strip())
+        query = query.filter(TransportOption.route_from.ilike(f"%{like}%", escape="\\"))
+    options = query.order_by(
+        TransportOption.duration_hours.asc(), TransportOption.price.asc()).all()
+    if options and trip.destination is not None:
+        origin_country: Optional[str] = None
+        if (trip.destination.country or "").strip().lower() not in ("", "india"):
+            try:
+                from backend.transportation.live_research import _geocode_origin
+
+                geo = _geocode_origin(trip.origin or "")
+                origin_country = geo[3] if geo else None
+            except Exception as exc:
+                logger.warning("Trip transport feasibility geocode skipped: %s", exc)
+                origin_country = None
+        if is_international_route(origin_country, trip.destination.country):
+            options = [o for o in options if (o.type or "").lower() == "flight"]
+    for option in options:
+        vendor = option.vendor if hasattr(option, "vendor") else None
+        option.provider_name = getattr(vendor, "name", None)
+    return options
+
+
 @router.post("/trips/{trip_id}/change-transport")
 def change_transport(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
+    """Switch the Day-1 transfer to another verified option for the trip's destination.
+
+    Server-side validation stays strict (id + same destination + active;
+    anything else is 400, never silently substituted). Only the transport
+    item is replaced — timing follows the option's duration, cost follows
+    its price (``cost_breakdown`` recomputes from the items), and every
+    other itinerary item is preserved. The option's real operator/schedule
+    details ride along in the item so the UI can show them + the booking
+    link without re-fetching.
+    """
+    from backend.transportation.details import transport_details_snapshot
+
     trip = _trip_or_404(db, trip_id)
     transport = db.query(TransportOption).filter(TransportOption.id == payload.get("transport_id"),
                                                   TransportOption.destination_id == trip.destination_id,
@@ -2333,8 +2398,24 @@ def change_transport(trip_id: str, payload: Dict[str, Any] = Body(default={}), d
     if not item:
         item = ItineraryItem(trip_id=trip.id, day_number=1, order_index=1, item_type="transport", title=transport.name)
         db.add(item)
-    item.transport_id, item.title, item.description, item.cost, item.status = transport.id, transport.name, f"{transport.route_from} to {transport.route_to}", transport.price, "confirmed"
-    return _commit_trip(db, trip, "transport_changed", "transport", transport.name, "Traveler selected a catalog transport option.")
+    item.transport_id = transport.id
+    item.title = transport.name
+    item.description = f"{transport.route_from} to {transport.route_to}"
+    item.location = transport.route_to
+    item.cost = float(transport.price or 0)
+    item.status = "confirmed"
+    # Affected timing follows the option's real duration on the standard
+    # Day-1 transfer window (same convention as the generator).
+    item.start_time = "09:30 AM"
+    try:
+        item.end_time = ItineraryGenerator._end_time("09:30 AM", transport.duration_hours)
+    except Exception:
+        item.end_time = "01:00 PM"
+    meta = dict(item.meta_data or {})
+    meta["ui"] = ItineraryGenerator._entity_ui_meta(transport)
+    meta["transport_details"] = transport_details_snapshot(transport)
+    item.meta_data = meta
+    return _commit_trip(db, trip, "transport_changed", "transport", transport.name, "Traveler switched to a verified transport option.")
 
 
 def _change_accommodation(trip_id: str, payload: Dict[str, Any], db: Session, daily: bool) -> Dict[str, Any]:

@@ -54,20 +54,46 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> Optiona
         return None
 
 
-def _route_distance_km(origin: str, destination: Destination) -> float:
-    """Straight-line origin->destination distance; fallback when geocoding fails."""
+def _geocode_origin(origin: str) -> Optional[tuple[float, float, str, Optional[str]]]:
+    """Geocode the origin to (lat, lng, display_name, country); None when unresolved.
+
+    Country is the last comma segment of the Nominatim display name
+    ("Mumbai, Maharashtra, India" -> "india"). Never invented: None when
+    the place cannot be geocoded.
+    """
     try:
         from backend.database.config import settings
         from backend.places.service import geocode_place
 
         geo = geocode_place(origin, settings.NOMINATIM_API_URL, settings.PLACES_TIMEOUT_S)
-        if geo and destination.latitude is not None and destination.longitude is not None:
-            distance = _haversine_km(geo[0], geo[1], destination.latitude, destination.longitude)
-            if distance and distance > 1:
-                return round(distance, 1)
+        if not geo:
+            return None
+        lat, lng, display = geo
+        country: Optional[str] = None
+        parts = [p.strip() for p in str(display or "").split(",") if p.strip()]
+        if parts:
+            country = parts[-1].lower()
+        return float(lat), float(lng), str(display), country
     except Exception as exc:
-        logger.warning("Transport distance geocode skipped for %s: %s", origin, exc)
-    return _FALLBACK_DISTANCE_KM
+        logger.warning("Transport origin geocode skipped for %s: %s", origin, exc)
+        return None
+
+
+def is_international_route(origin_country: Optional[str], dest_country: Optional[str]) -> bool:
+    """True when the origin and destination countries genuinely differ.
+
+    Surface modes cannot cross borders, so international pairs are flight
+    only. Unknown origin + non-Indian destination is treated as
+    international (safe); unknown origin + Indian/empty destination stays
+    domestic (matches historical behavior).
+    """
+    dest = (dest_country or "").strip().lower()
+    orig = (origin_country or "").strip().lower() or None
+    if orig and dest:
+        return orig != dest
+    if not orig:
+        return dest not in ("", "india")
+    return False
 
 
 def _mode_estimates(
@@ -76,16 +102,40 @@ def _mode_estimates(
     distance_km: float,
     traveler_count: int,
     currency: str,
+    international: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Deterministic real-mode estimates for an Indian origin->destination pair.
+    """Deterministic real-mode estimates for an origin->destination pair.
 
     Prices are totals for the whole party (matching the catalog ``price``
     semantics the generator sums directly, not per-person). Flight/train/bus
     scale with travelers; a private cab is one vehicle for up to 6.
+
+    International pairs offer flight only: surface modes are not
+    geographically feasible across borders (e.g. Mumbai -> Singapore never
+    lists train/road). Schedule-level details (service numbers, departure
+    times, availability, booking URLs) are left None — estimates must never
+    fabricate them.
     """
     travelers = max(1, int(traveler_count or 1))
     distance = max(10.0, float(distance_km or _FALLBACK_DISTANCE_KM))
     modes: List[Dict[str, Any]] = []
+    if international:
+        # Flight-only: no surface mode can serve a cross-border pair.
+        per_person = 6500.0 + distance * 5.5
+        modes.append({
+            "type": "flight",
+            "name": f"Flight {origin} to {destination_name}",
+            "route_from": origin,
+            "route_to": destination_name,
+            "duration_hours": round(2.0 + distance / 650.0, 1),
+            "price": round(per_person * travelers, 2),
+            "capacity": 180,
+            "features": ["Fastest option", "Check passport/visa requirements"],
+        })
+        for mode in modes:
+            mode["currency"] = currency
+            mode["distance_km"] = round(distance, 1)
+        return modes
     # Flight: viable beyond short hops; ~650 km/h block speed + airport overhead.
     if distance >= 250:
         per_person = 3500.0 + distance * 4.5
@@ -174,7 +224,8 @@ def research_live_transport_options(
     "distance_km": float, "error": Optional[str]}``. Never raises.
     """
     result: Dict[str, Any] = {
-        "researched": 0, "options": [], "source": "catalog", "distance_km": None, "error": None,
+        "researched": 0, "options": [], "source": "catalog", "distance_km": None,
+        "international": False, "origin_country": None, "error": None,
     }
     clean_origin = (origin or "").strip()
     if not clean_origin or destination is None:
@@ -189,13 +240,28 @@ def research_live_transport_options(
             TransportOption.capacity >= travelers,
             func.lower(TransportOption.route_from).contains(clean_origin.lower()),
         ).order_by(TransportOption.duration_hours.asc(), TransportOption.price.asc()).all()
+        # Geographically feasible only: on international pairs, surface
+        # catalog rows (if any) are not offerable — same rule as research.
+        geo = _geocode_origin(clean_origin)
+        origin_country = geo[3] if geo else None
+        international = is_international_route(origin_country, getattr(destination, "country", None))
+        result["international"] = international
+        result["origin_country"] = origin_country
         if existing:
-            result["options"] = existing
-            return result
+            if international:
+                existing = [o for o in existing if (o.type or "").lower() == "flight"]
+            if existing:
+                result["options"] = existing
+                return result
 
-        distance_km = _route_distance_km(clean_origin, destination)
+        distance_km = _FALLBACK_DISTANCE_KM
+        if geo and destination.latitude is not None and destination.longitude is not None:
+            measured = _haversine_km(geo[0], geo[1], destination.latitude, destination.longitude)
+            if measured and measured > 1:
+                distance_km = round(measured, 1)
         result["distance_km"] = distance_km
-        estimates = _mode_estimates(clean_origin, destination.name, distance_km, travelers, currency)
+        estimates = _mode_estimates(clean_origin, destination.name, distance_km, travelers,
+                                    currency, international)
 
         ranked_modes: List[Dict[str, Any]] = list(estimates)
         analysis_source = "distance_fallback"
@@ -203,7 +269,10 @@ def research_live_transport_options(
             try:
                 analysis = gemini_service.analyze_transport_options({
                     "origin": clean_origin,
+                    "origin_country": origin_country,
                     "destination": destination.name,
+                    "destination_country": getattr(destination, "country", None),
+                    "international": international,
                     "distance_km": distance_km,
                     "traveler_count": travelers,
                     "currency": currency,
@@ -265,6 +334,17 @@ def research_live_transport_options(
                 latitude=getattr(destination, "latitude", None),
                 longitude=getattr(destination, "longitude", None),
                 source_url=None,
+                # Estimate rows carry no operator/schedule truth: every
+                # enriched detail stays NULL (unknown) so the UI hides it
+                # instead of showing invented times, numbers, or links.
+                service_number=None,
+                operator_name=None,
+                departure_time=None,
+                arrival_time=None,
+                stops=[],
+                travel_class=None,
+                availability_status=None,
+                booking_url=None,
                 # TransportOption has no description column; the analyst
                 # reason is kept in evidence only (never invented bookings).
                 evidence=[{"label": analysis_source, "note": reason[:500]}],

@@ -36,7 +36,7 @@ class DynamicDestinationDiscoveryService:
             # researched transport carries genuine origin routes. The research
             # client echoes unknown keys into its prompt; absent origin simply
             # omits the hint (never a default city).
-            "origin": (trip_in.origin or "").strip() or None,
+            "origin": (getattr(trip_in, "origin", None) or "").strip() or None,
             "duration_days": int(trip_in.duration_days or 4),
             "budget": float(trip_in.total_budget or 50000.0),
             "currency": (trip_in.currency or "INR").upper(),
@@ -213,6 +213,23 @@ class DynamicDestinationDiscoveryService:
             longitude=data["longitude"],
             source_url=data["evidence"][0]["url"],
             evidence=data["evidence"],
+            # Optional operator/schedule keys: persisted only when research
+            # actually supplies them (None = unknown, UI hides it).
+            service_number=(str(data.get("service_number")).strip() or None
+                            if data.get("service_number") else None),
+            operator_name=(str(data.get("operator_name")).strip() or None
+                           if data.get("operator_name") else None),
+            departure_time=(str(data.get("departure_time")).strip() or None
+                            if data.get("departure_time") else None),
+            arrival_time=(str(data.get("arrival_time")).strip() or None
+                          if data.get("arrival_time") else None),
+            stops=self._list(data.get("stops")) or [],
+            travel_class=(str(data.get("travel_class")).strip() or None
+                          if data.get("travel_class") else None),
+            availability_status=(str(data.get("availability_status")).strip() or None
+                                 if data.get("availability_status") else None),
+            booking_url=(str(data.get("booking_url")).strip() or None
+                         if data.get("booking_url") else None),
             inventory_source="discovered",
             verification_status="verified_candidate",
             discovery_session_id=discovery_session_id,

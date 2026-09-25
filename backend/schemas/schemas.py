@@ -334,6 +334,15 @@ class TransportBase(BaseModel):
     longitude: Optional[float] = None
     source_url: Optional[str] = None
     evidence: Optional[List[Dict[str, Any]]] = []
+    # Enriched operator/schedule details (provider-supplied only; None = unknown).
+    service_number: Optional[str] = None
+    operator_name: Optional[str] = None
+    departure_time: Optional[str] = None
+    arrival_time: Optional[str] = None
+    stops: Optional[List[str]] = []
+    travel_class: Optional[str] = None
+    availability_status: Optional[str] = None
+    booking_url: Optional[str] = None
     inventory_source: Optional[str] = "catalog"
     verification_status: Optional[str] = "catalog_verified"
     discovery_session_id: Optional[str] = None

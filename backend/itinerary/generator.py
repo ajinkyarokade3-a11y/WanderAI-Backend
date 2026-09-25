@@ -295,6 +295,8 @@ class ItineraryGenerator:
         used_orders = set(occupied_orders)
         new_items: List[ItineraryItem] = []
         if transport:
+            from backend.transportation.details import transport_details_snapshot
+
             new_items.append(
                 ItineraryItem(
                     trip_id=trip.id,
@@ -309,7 +311,8 @@ class ItineraryGenerator:
                     status="proposed",
                     transport_id=transport.id,
                     location=transport.route_to,
-                    meta_data={"ui": self._entity_ui_meta(transport)},
+                    meta_data={"ui": self._entity_ui_meta(transport),
+                               "transport_details": transport_details_snapshot(transport)},
                 )
             )
 

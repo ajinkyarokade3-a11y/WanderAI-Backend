@@ -184,6 +184,17 @@ class TransportOption(Base):
     longitude = Column(Float, nullable=True)
     source_url = Column(String(1024), nullable=True)
     evidence = Column(JSON, default=list)
+    # Enriched operator/schedule details. Every field is nullable and only
+    # ever holds provider-supplied values — NULL means unknown and the UI
+    # hides the row instead of showing invented schedules, prices, or links.
+    service_number = Column(String(100), nullable=True)  # flight/train/service number
+    operator_name = Column(String(255), nullable=True)  # airline/operator display name
+    departure_time = Column(String(50), nullable=True)  # free text, e.g. "06:40"
+    arrival_time = Column(String(50), nullable=True)
+    stops = Column(JSON, default=list)  # connection info, e.g. ["1 stop via Delhi"]
+    travel_class = Column(String(100), nullable=True)  # e.g. "AC 2-tier", "Economy"
+    availability_status = Column(String(100), nullable=True)  # NULL = unknown
+    booking_url = Column(String(1024), nullable=True)  # REAL provider URL only
     inventory_source = Column(String(50), default="catalog", nullable=False)
     verification_status = Column(String(50), default="catalog_verified", nullable=False)
     discovery_session_id = Column(String(64), nullable=True, index=True)
