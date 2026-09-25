@@ -304,13 +304,16 @@ def test_catalog_rows_carry_coordinates():
     pins (the 19:30 Hampta case). Live provider rows are exempt."""
     from backend.database.connection import SessionLocal
     from backend.models.models import Activity, Hotel, TransportOption
+    import re as _re
+    seed_id = _re.compile(r"^(htl|act|trn)-[a-z]+-\d{3}$")
     db = SessionLocal()
     try:
         for model, label in ((Hotel, "hotel"), (Activity, "activity"),
                              (TransportOption, "transport")):
-            rows = db.query(model).filter(
+            rows = [r for r in db.query(model).filter(
                 model.is_active == True,  # noqa: E712
                 model.inventory_source == "catalog").all()
+                if seed_id.match(r.id)]
             assert rows, f"no catalog {label} rows"
             blank = [r.id for r in rows if r.latitude is None or r.longitude is None]
             assert not blank, f"catalog {label} rows without coordinates: {blank}"

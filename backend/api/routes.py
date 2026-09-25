@@ -358,6 +358,31 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                 catalog_images = None
             if catalog_images:
                 row["image_url"] = catalog_images[0]
+        # Coordinate fallback (same rule as /map): resolve from the linked
+        # catalog row so pins work from the trip payload too, not just the
+        # map endpoint. Invalid pairs stay absent (never fabricated).
+        try:
+            _lat, _lng = row.get("latitude"), row.get("longitude")
+            _lat, _lng = float(_lat), float(_lng)
+            if not (-90 <= _lat <= 90 and -180 <= _lng <= 180):
+                raise ValueError
+            row["latitude"], row["longitude"] = _lat, _lng
+        except (TypeError, ValueError):
+            _clat, _clng = None, None
+            try:
+                if item.hotel is not None:
+                    _clat, _clng = item.hotel.latitude, item.hotel.longitude
+                elif item.activity is not None:
+                    _clat, _clng = item.activity.latitude, item.activity.longitude
+                elif item.transport is not None:
+                    _clat, _clng = item.transport.latitude, item.transport.longitude
+                _clat, _clng = float(_clat), float(_clng)
+                if not (-90 <= _clat <= 90 and -180 <= _clng <= 180):
+                    raise ValueError
+                row["latitude"], row["longitude"] = _clat, _clng
+            except (TypeError, ValueError, AttributeError):
+                row.pop("latitude", None)
+                row.pop("longitude", None)
         # Last fallback (places only): the destination-level photo. Used
         # solely when no specific place photo exists — never preferred over
         # a real place image. Transport/notes stay imageless by design.
