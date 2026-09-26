@@ -1644,11 +1644,16 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
             raise HTTPException(status_code=422, detail="Selected transport currency does not match the trip currency")
 
     # 3. Create Trip entity
+    # Lifecycle rule: generation ALWAYS starts unconfirmed (planning), no
+    # matter what status a client sends. Only POST /trips/{id}/confirm flips
+    # planning/draft -> confirmed (traveler action), and only the operator
+    # accept endpoint flips confirmed -> ongoing (operator action).
+    # This guarantees: generated = Preview-only, confirmed = actionable.
     trip = Trip(
         user_id=user_id,
         destination_id=destination.id,
         title=trip_in.title,
-        status=trip_in.status or "planning",
+        status="planning",
         start_date=trip_in.start_date,
         end_date=trip_in.end_date,
         duration_days=duration_days,
@@ -1832,12 +1837,20 @@ def trip_map(trip_id: str, db: Session = Depends(get_db)):
 
 @router.put("/trips/{trip_id}")
 def update_trip(trip_id: str, trip_in: TripUpdate, db: Session = Depends(get_db)):
-    """Update Trip attributes and record change history."""
+    """Update Trip attributes and record change history.
+
+    Lifecycle guard: clients cannot flip status directly (e.g. planning ->
+    confirmed, or anything -> ongoing). Status moves only via the dedicated
+    transitions: POST /trips/{id}/confirm (traveler) and
+    POST /ops/trips/{id}/accept (operator). Direct status writes are ignored
+    so unconfirmed trips stay Preview-only for operators.
+    """
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
     update_data = trip_in.model_dump(exclude_unset=True)
+    update_data.pop("status", None)
     for field, value in update_data.items():
         old_val = str(getattr(trip, field, ""))
         setattr(trip, field, value)
@@ -2268,7 +2281,19 @@ def _set_trip_request_status(trip_id: str, status: str, db: Session):
 
 @router.post("/trips/{trip_id}/accept-request")
 def accept_trip_request(trip_id: str, db: Session = Depends(get_db)):
-    return _set_trip_request_status(trip_id, "confirmed", db)
+    """Retired operator shortcut — always 410.
+
+    Accept & Assign now runs exclusively through the operator pipeline
+    (POST /ops/trips/{id}/approve then POST /ops/trips/{id}/accept), which
+    enforces traveler-confirmation (409 on planning Preview trips) and flips
+    confirmed -> ongoing on the same Trip row. This legacy route used to flip
+    ANY trip to confirmed with no auth and no confirmation check, which would
+    let operators action unconfirmed Preview trips. Nothing calls it anymore.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="accept-request is retired: use POST /ops/trips/{id}/approve then POST /ops/trips/{id}/accept (traveler-confirmed trips only)",
+    )
 
 
 @router.post("/trips/{trip_id}/decline-request")
