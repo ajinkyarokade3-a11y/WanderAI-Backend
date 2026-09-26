@@ -1,4 +1,15 @@
+from pathlib import Path
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load the repo-root .env into the process environment (no override of real
+# env vars) so BOTH pydantic-settings fields AND direct os.getenv() reads
+# (e.g. OPERATOR_LOGIN_PASSWORD in backend/api/routes.py::operator_login)
+# observe the same values regardless of the caller's working directory.
+# Path is anchored to this file so `pytest tests/...`, `uvicorn`, and IDE
+# runs from any cwd resolve the same file.
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+load_dotenv(dotenv_path=_ENV_FILE, override=False)
 
 
 class Settings(BaseSettings):
@@ -87,6 +98,10 @@ class Settings(BaseSettings):
     # the built-in default is development-only.
     TRAVELER_JWT_SECRET: str = "dev-only-traveler-jwt-secret-change-in-production"
     TRAVELER_JWT_EXPIRY_DAYS: int = 7
+    # Operator shared-password login. Server-side only, never frontend.
+    # POST /api/auth/operator-login fail-closes with 503 while this is empty.
+    # Empty default here = "not configured"; set it in the local .env only.
+    OPERATOR_LOGIN_PASSWORD: str = ""
 
 
 settings = Settings()

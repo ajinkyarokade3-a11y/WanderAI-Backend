@@ -696,6 +696,27 @@ def ensure_catalog_backfill(db: Session) -> None:
         logger.info(f"Catalog backfill: inserted {inserted} missing catalog inventory rows.")
 
 
+def ensure_fleet_seed(db: Session) -> None:
+    """Idempotent dispatch fleet (vehicles + drivers) for older databases.
+
+    Fresh databases get these rows in the main seed flow; existing databases
+    seeded before the fleet existed gain them here on next startup. Rows are
+    keyed by stable PKs and only inserted when absent.
+    """
+    if not db.query(Vehicle).first():
+        db.add_all([
+            Vehicle(id="veh-001", name="Mahindra Thar 4x4", registration_number="HP01-TRAN-1001", vehicle_type="private_cab", capacity=4, is_active=True),
+            Vehicle(id="veh-002", name="Toyota Innova Crysta", registration_number="HP01-TRAN-1002", vehicle_type="private_cab", capacity=6, is_active=True),
+            Vehicle(id="veh-003", name="Volvo 9400 Coach", registration_number="HP01-TRAN-2001", vehicle_type="volvo_bus", capacity=40, is_active=True),
+        ])
+    if not db.query(Driver).first():
+        db.add_all([
+            Driver(id="drv-001", name="Tenzin Norbu", phone="+91 98160 10001", license_number="HP-DL-20180001", is_active=True),
+            Driver(id="drv-002", name="Amit Thakur", phone="+91 98160 10002", license_number="HP-DL-20190002", is_active=True),
+            Driver(id="drv-003", name="Rajesh Kumar", phone="+91 98160 10003", license_number="HP-DL-20200003", is_active=True),
+        ])
+
+
 def run_seed():
     """Deterministic Database Seeding for TourFlow AI Foundation."""
     # Ensure tables exist
@@ -708,6 +729,7 @@ def run_seed():
             logger.info("Database already seeded with foundation data.")
             ensure_catalog_backfill(db)
             ensure_catalog_coordinates(db)
+            ensure_fleet_seed(db)
             db.commit()
             return
 
@@ -1285,6 +1307,7 @@ def run_seed():
         db.add(demo_review)
 
         # Dispatch fleet inventory
+        # fresh databases, so older databases gain the fleet on next startup).
         if not db.query(Vehicle).first():
             db.add_all([
                 Vehicle(id="veh-001", name="Mahindra Thar 4x4", registration_number="HP01-TRAN-1001", vehicle_type="private_cab", capacity=4, is_active=True),

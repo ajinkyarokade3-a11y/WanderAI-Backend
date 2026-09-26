@@ -15,13 +15,13 @@ from backend.models.models import (
     AccommodationAssignment,
     Activity,
     ActivityAssignment,
+    ChangeHistory,
     Destination,
     Driver,
     Hotel,
     Notification,
     TransportAssignment,
     Trip,
-    TripApproval,
     TripApproval,
     TripMessage,
     User,
@@ -49,8 +49,55 @@ class OpsForbidden(PermissionError):
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Trip lifecycle (single Trip row is the source of truth; no duplicates).
+#
+#   planning   = generated, visible to operator as Preview only
+#                (Pending Traveler Confirmation — read-only for operators)
+#   confirmed  = traveler confirmed, actionable operator request
+#                (Pending Operator Assignment — Accept & Assign enabled)
+#   ongoing    = operator accepted/assigned (Active tour under management)
+#   completed / cancelled = terminal states
+#
+# Operator stage gates (409 when violated):
+#   approve / accept require confirmed|ongoing (never planning)
+#   assignment mutations (hotel/transport/activity attach, notify) require
+#   confirmed|ongoing through _require_actionable_trip
 # ---------------------------------------------------------------------------
+
+ACTIONABLE_TRIP_STATUSES = ("confirmed", "ongoing")
+PREVIEW_TRIP_STATUSES = ("planning", "draft")
+
+
+def _trip_lifecycle_state(trip: Trip) -> str:
+    """Operator-facing lifecycle label derived from Trip + approval rows."""
+    if trip is None:
+        return "unknown"
+    status = (getattr(trip, "status", None) or "").strip().lower()
+    if status in ("cancelled", "completed"):
+        return status
+    if status == "ongoing":
+        return "active"
+    return status or "planning"
+
+
+def _require_actionable_trip(db: Session, trip_id: str) -> Optional[Trip]:
+    """409 when the Trip row exists but is still pending traveler confirmation.
+
+    planning/draft trips are operator Preview only: visible in GET /ops/trips
+    but immutable — no approve, accept, assign, dispatch, or notify.
+
+    Synthetic trip ids with no Trip row are NOT gated here (returns None):
+    legacy approval/unlock checks below govern them, preserving existing
+    API behavior for assignment-scoped test ids.
+    """
+    trip = db.query(Trip).filter(Trip.id == _require_trip_id(trip_id)).first()
+    if trip is None:
+        return None
+    if (trip.status or "").strip().lower() not in ACTIONABLE_TRIP_STATUSES:
+        raise OpsConflict(
+            "Trip is pending traveler confirmation and is read-only for operators"
+        )
+    return trip
 
 def _require_trip_id(trip_id: Any) -> str:
     cleaned = str(trip_id or "").strip()
@@ -59,6 +106,24 @@ def _require_trip_id(trip_id: Any) -> str:
     if len(cleaned) > 255:
         raise OpsValidation("trip_id is too long")
     return cleaned
+
+
+def _get_trip_or_404(db: Session, trip_id: str) -> Trip:
+    """Fetch the Trip row or raise 404 (single source of truth)."""
+    trip = db.query(Trip).filter(Trip.id == _require_trip_id(trip_id)).first()
+    if not trip:
+        raise OpsNotFound("Trip not found")
+    return trip
+
+
+def _bump_trip_version(db: Session, trip: Trip) -> None:
+    """Stamp updated_at so the operator sync-version poll observes the change."""
+    from datetime import datetime as _datetime
+
+    try:
+        trip.updated_at = _datetime.utcnow()
+    except Exception:
+        pass
 
 
 def _parse_dt(value: Any, field: str) -> Optional[datetime]:
@@ -178,6 +243,7 @@ def create_accommodation_assignment(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     _require_approved(db, trip_id)
     if (
         db.query(AccommodationAssignment)
@@ -221,6 +287,7 @@ def replace_accommodation_assignment(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     _require_approved(db, trip_id)
     row = (
         db.query(AccommodationAssignment)
@@ -256,6 +323,7 @@ def update_room_allocation(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     row = (
         db.query(AccommodationAssignment)
         .filter(AccommodationAssignment.trip_id == trip_id)
@@ -280,6 +348,7 @@ def flag_accommodation_issue(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     row = (
         db.query(AccommodationAssignment)
         .filter(AccommodationAssignment.trip_id == trip_id)
@@ -301,6 +370,7 @@ def flag_accommodation_issue(
 def resolve_accommodation_issue(db: Session, trip_id: str) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     row = (
         db.query(AccommodationAssignment)
         .filter(AccommodationAssignment.trip_id == trip_id)
@@ -580,6 +650,7 @@ def create_transport_assignment(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     _require_approved(db, trip_id)
     if (
         db.query(TransportAssignment)
@@ -633,6 +704,7 @@ def replace_transport_assignment(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     _require_approved(db, trip_id)
     row = (
         db.query(TransportAssignment)
@@ -686,6 +758,7 @@ def update_journey_timing(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     row = (
         db.query(TransportAssignment)
         .filter(TransportAssignment.trip_id == trip_id)
@@ -739,6 +812,7 @@ def transition_transport_status(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     row = (
         db.query(TransportAssignment)
         .filter(TransportAssignment.trip_id == trip_id)
@@ -821,10 +895,15 @@ def _approval_dict(approval: Optional[TripApproval], trip_id: str) -> Dict[str, 
 
 
 def approve_trip(db: Session, trip_id: str, updated_by: str = "operator") -> Dict[str, Any]:
-    """Operator approves a traveler-confirmed trip. Idempotent."""
+    """Operator approves a traveler-confirmed trip. Idempotent.
+
+    409 while the trip is still pending traveler confirmation (planning/draft):
+    unconfirmed trips are Preview-only for operators.
+    """
     from datetime import datetime as _datetime
 
     trip_id = _require_trip_id(trip_id)
+    _require_actionable_trip(db, trip_id)
     approval = _get_approval(db, trip_id)
     now = _datetime.utcnow()
     if approval is None:
@@ -846,17 +925,39 @@ def approve_trip(db: Session, trip_id: str, updated_by: str = "operator") -> Dic
 def accept_trip_assignment(
     db: Session, trip_id: str, updated_by: str = "operator"
 ) -> Dict[str, Any]:
-    """Start the assignment workflow ("Accept & Assign"). Requires approval."""
+    """Start the assignment workflow ("Accept & Assign").
+
+    Requires operator approval AND a traveler-confirmed trip. Accepting flips
+    the Trip row confirmed -> ongoing (Active tour) on the SAME row — no
+    duplicate trip records. Idempotent: re-accept returns current state.
+    """
     from datetime import datetime as _datetime
 
     trip_id = _require_trip_id(trip_id)
+    trip = _require_actionable_trip(db, trip_id)
     approval = _require_approved(db, trip_id)
     _require_unlocked(db, trip_id)
     if not approval.assignment_started:
         approval.assignment_started = True
         approval.assignment_started_at = _datetime.utcnow()
-        db.commit()
-        db.refresh(approval)
+    if trip is not None and (trip.status or "").strip().lower() == "confirmed":
+        trip.status = "ongoing"
+        _bump_trip_version(db, trip)
+        db.add(
+            ChangeHistory(
+                trip_id=trip.id,
+                changed_by="operator",
+                action="trip_accepted",
+                field_changed="status",
+                old_value="confirmed",
+                new_value="ongoing",
+                reason="Operator accepted the confirmed trip; tour is now active",
+            )
+        )
+    db.commit()
+    db.refresh(approval)
+    if trip is not None:
+        db.refresh(trip)
     return _approval_dict(approval, trip_id)
 
 
@@ -1095,6 +1196,9 @@ def notify_traveler(
     event = (event or "").strip()
     if event not in _NOTIFY_TITLES:
         raise OpsValidation(f"event must be one of {sorted(_NOTIFY_TITLES)}")
+    # Dispatch (notify) is an operator action: blocked while the trip is
+    # still pending traveler confirmation.
+    _require_actionable_trip(db, trip_id)
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if trip is not None:
         user_id: Optional[str] = trip.user_id
@@ -1417,6 +1521,7 @@ def create_activity_assignment(
 ) -> Dict[str, Any]:
     trip_id = _require_trip_id(trip_id)
     _require_unlocked(db, trip_id)
+    _require_actionable_trip(db, trip_id)
     _require_approved(db, trip_id)
     activity = _get_activity(db, activity_id)
     vendor = _get_ops_vendor(db, vendor_id) if vendor_id else None
@@ -1473,6 +1578,7 @@ def replace_activity_assignment(
     if not row:
         raise OpsNotFound("Activity assignment not found")
     _require_unlocked(db, row.trip_id)
+    _require_actionable_trip(db, row.trip_id)
     _require_approved(db, row.trip_id)
     if activity_id is not None:
         row.activity_id = _get_activity(db, activity_id).id
@@ -1523,6 +1629,7 @@ def update_activity_allocation(
     if not row:
         raise OpsNotFound("Activity assignment not found")
     _require_unlocked(db, row.trip_id)
+    _require_actionable_trip(db, row.trip_id)
     if participants is not None and (
         not isinstance(participants, int) or isinstance(participants, bool) or participants < 0
     ):
@@ -1553,6 +1660,7 @@ def confirm_activity_assignment(db: Session, assignment_id: str) -> Dict[str, An
     if not row:
         raise OpsNotFound("Activity assignment not found")
     _require_unlocked(db, row.trip_id)
+    _require_actionable_trip(db, row.trip_id)
     _require_approved(db, row.trip_id)
     _validate_allocation_complete(row)
     start = _time_to_minutes(row.start_time, "start_time")
@@ -1577,6 +1685,7 @@ def flag_activity_issue(db: Session, assignment_id: str, reason: str) -> Dict[st
     if not row:
         raise OpsNotFound("Activity assignment not found")
     _require_unlocked(db, row.trip_id)
+    _require_actionable_trip(db, row.trip_id)
     reason = (reason or "").strip()
     if not reason:
         raise OpsValidation("reason is required to flag an issue")
@@ -1596,6 +1705,7 @@ def resolve_activity_issue(db: Session, assignment_id: str) -> Dict[str, Any]:
     if not row:
         raise OpsNotFound("Activity assignment not found")
     _require_unlocked(db, row.trip_id)
+    _require_actionable_trip(db, row.trip_id)
     try:
         _validate_allocation_complete(row)
         start = _time_to_minutes(row.start_time, "start_time")
@@ -1847,6 +1957,10 @@ def confirm_trip(db: Session, trip_id: str, user_id: Optional[str] = None) -> Di
     trip.status = "confirmed"
     trip.confirmed_at = now
     trip.confirmed_by = trip.user_id
+    # Confirmation must surface to the operator immediately: the operator
+    # portal polls GET /api/sync/version (max Trip.updated_at), so stamp the
+    # same row — no duplicate trip records, same trip id.
+    _bump_trip_version(db, trip)
     db.add(
         _ChangeHistory(
             trip_id=trip.id,

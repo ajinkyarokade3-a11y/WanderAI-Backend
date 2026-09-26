@@ -1,7 +1,9 @@
 """Traveler password authentication (JWT) and traveler-owned trip snapshots.
 
-Operator authentication is separate (env-shared password in
-``backend/api/routes.py::operator_login``) and intentionally untouched.
+Operator sessions reuse the same JWT machinery with a distinct ``operator``
+role claim (``issue_operator_token`` / ``get_current_operator``); the
+env-shared operator password check itself lives in
+``backend/api/routes.py::operator_login``.
 """
 
 import logging
@@ -146,6 +148,56 @@ def get_current_traveler(request: Request, db: Session = Depends(get_db)) -> Use
         return _traveler_from_token(db, token.strip())
     except AuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
+
+
+def issue_operator_token(user_id: str) -> str:
+    """Signed operator session token (same JWT machinery as travelers).
+
+    Carries role ``operator`` so operator sessions are distinguishable from
+    traveler sessions; verified by ``get_current_operator`` below.
+    """
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "role": "operator",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=settings.TRAVELER_JWT_EXPIRY_DAYS)).timestamp()),
+    }
+    return jwt.encode(payload, settings.TRAVELER_JWT_SECRET, algorithm="HS256")
+
+
+def _operator_from_token(db: Session, token: str) -> User:
+    user_id = parse_traveler_token(token)
+    user = (
+        db.query(User)
+        .filter(User.id == user_id, User.is_active == True)  # noqa: E712
+        .first()
+    )
+    if not user:
+        raise AuthError("invalid session")
+    if user.role not in ("operator", "admin"):
+        raise AuthError("operator access required")
+    return user
+
+
+def get_current_operator(request: Request, db: Session = Depends(get_db)) -> User:
+    """FastAPI dependency: verified operator/admin from the Authorization header.
+
+    401 when the session is missing or invalid; 403 when a valid non-operator
+    session (e.g. a traveler JWT) is presented.
+    """
+    header = request.headers.get("authorization") or ""
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="operator authentication required")
+    try:
+        return _operator_from_token(db, token.strip())
+    except AuthError as exc:
+        detail = str(exc)
+        raise HTTPException(
+            status_code=403 if detail == "operator access required" else 401,
+            detail=detail,
+        )
 
 
 def traveler_dict(user: User) -> Dict[str, Any]:

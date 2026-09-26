@@ -18,6 +18,7 @@ from backend.replanning.engine import ReplanningEngine
 from backend.recommendation.engine import RecommendationEngine
 from database.seed_data.seed import run_seed
 from backend.research.service import DestinationResearchService
+from backend.database.config import settings
 from backend.schemas.schemas import ResearchContext
 from backend.accommodation.service import AccommodationRecommendationService, AccommodationExecutionError
 from backend.schemas.schemas import AccommodationContext, AccommodationCrewOutput
@@ -3020,6 +3021,8 @@ def test_ops_pipeline_gates_assignments_before_approval():
     activity_id, _, _ = _ops_activity_id()
     trip_id = "ops-pipe-gated-001"
 
+    # Synthetic assignment-scoped ids keep legacy behavior: 409 until the
+    # operator approves (approval gate), then the workflow proceeds.
     assert client.post("/api/ops/accommodations", json={
         "trip_id": trip_id, "hotel_id": hotel_id, "rooms": 1}).status_code == 409
     assert client.post("/api/ops/transport", json={
@@ -3686,8 +3689,10 @@ def test_traveler_trip_ownership_isolation_and_relogin():
 
 
 def test_operator_login_untouched_by_traveler_auth(monkeypatch):
-    # Unconfigured operator password still reports 503
+    # Unconfigured operator password still reports 503 (both process env AND
+    # Settings fallback cleared; Settings caches the repo-root .env at import).
     monkeypatch.delenv("OPERATOR_LOGIN_PASSWORD", raising=False)
+    monkeypatch.setattr(settings, "OPERATOR_LOGIN_PASSWORD", "")
     assert client.post("/api/auth/operator-login", json={
         "email": "rahul.operator@tourflow.ai", "password": "x"}).status_code == 503
     # Configured shared password keeps working and rejects wrong passwords

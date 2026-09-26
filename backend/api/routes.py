@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from backend.database.connection import get_db
 from backend.models.models import (
     Destination, Hotel, Activity, TransportOption, Trip, TripPreference,
-    User, ItineraryItem, Booking, Alert, Notification, ChangeHistory, Review
+    User, ItineraryItem, Booking, Alert, Notification, ChangeHistory, Review,
+    TripApproval,
 )
 from backend.schemas.schemas import (
     DestinationRead, HotelRead, ActivityRead, TransportRead,
@@ -54,6 +55,7 @@ from backend.hotels.service import SerpApiError, search_serpapi_hotels
 from backend.recommendation.engine import RecommendationEngine
 from backend.dynamic_destination.service import DynamicDestinationDiscoveryError, DynamicDestinationDiscoveryService
 from backend.itinerary.generator import ItineraryGenerationError, ItineraryGenerator
+from backend.auth.service import get_current_operator
 from backend.replanning.engine import ReplanningEngine
 import logging
 import os
@@ -1356,7 +1358,11 @@ def confirm_trip_route(trip_id: str, payload: TripConfirmRequest, db: Session = 
 
 @router.post("/ops/trips/{trip_id}/approve", response_model=TripApprovalRead)
 def ops_approve_trip(trip_id: str, payload: TripApprovalRequest, db: Session = Depends(get_db)):
-    """Operator approves a traveler-confirmed trip (idempotent)."""
+    """Operator approves a traveler-confirmed trip (idempotent).
+
+    409 while the Trip row exists but is still planning/draft (Pending
+    Traveler Confirmation): unconfirmed trips are Preview-only.
+    """
     from backend.ops.service import approve_trip
     try:
         return approve_trip(db, trip_id, payload.updated_by or "operator")
@@ -1366,7 +1372,11 @@ def ops_approve_trip(trip_id: str, payload: TripApprovalRequest, db: Session = D
 
 @router.post("/ops/trips/{trip_id}/accept", response_model=TripApprovalRead)
 def ops_accept_trip(trip_id: str, payload: TripApprovalRequest, db: Session = Depends(get_db)):
-    """Start the assignment workflow (Accept & Assign). Requires approval."""
+    """Accept & Assign: confirmed -> ongoing (Active tour) on the SAME Trip row.
+
+    Requires operator approval + traveler confirmation (409 otherwise).
+    The status flip bumps updated_at so traveler + operator polls observe it.
+    """
     from backend.ops.service import accept_trip_assignment
     try:
         return accept_trip_assignment(db, trip_id, payload.updated_by or "operator")
@@ -2266,6 +2276,104 @@ def decline_trip_request(trip_id: str, db: Session = Depends(get_db)):
     return _set_trip_request_status(trip_id, "cancelled", db)
 
 
+def _operator_traveler_block(trip: Trip) -> Dict[str, Any]:
+    """Traveler identity for operator views: id + name only.
+
+    Email/phone stay out of operator payloads (unnecessary private data).
+    """
+    try:
+        user = trip.user
+        name = getattr(user, "full_name", None) if user is not None else None
+    except Exception:
+        name = None
+    return {"id": trip.user_id, "name": name}
+
+
+def _operator_lifecycle_block(trip: Trip, db: Session) -> Dict[str, Any]:
+    """Operator lifecycle gate for one Trip row (derived, never stored twice).
+
+    planning/draft  -> lifecycle "pending_traveler_confirmation",
+                       Preview-only (operator_actionable=False)
+    confirmed       -> lifecycle "pending_operator_assignment",
+                       actionable (operator_actionable=True)
+    ongoing         -> lifecycle "active", actionable
+    completed/cancelled -> terminal lifecycle, not actionable
+    """
+    from backend.ops.service import ACTIONABLE_TRIP_STATUSES
+
+    status = (getattr(trip, "status", None) or "").strip().lower()
+    approval = None
+    try:
+        approval = db.query(TripApproval).filter(TripApproval.trip_id == trip.id).first()
+    except Exception:
+        approval = None
+    actionable = status in ACTIONABLE_TRIP_STATUSES
+    if status in ("planning", "draft"):
+        lifecycle = "pending_traveler_confirmation"
+    elif status == "confirmed":
+        lifecycle = "pending_operator_assignment"
+    elif status == "ongoing":
+        lifecycle = "active"
+    else:
+        lifecycle = status or "planning"
+    return {
+        "lifecycle": lifecycle,
+        "operator_actionable": actionable,
+        "approval": {
+            "approved": bool(approval and approval.approved),
+            "assignment_started": bool(approval and approval.assignment_started),
+            "finalized": bool(approval and approval.finalized),
+        },
+    }
+
+
+@router.get("/ops/trips")
+def ops_list_trips(status: Optional[str] = None, search: Optional[str] = None,
+                   db: Session = Depends(get_db),
+                   current: User = Depends(get_current_operator)):
+    """Canonical traveler trips for the Operator app (secure).
+
+    Same Trip rows the Traveler app creates — the backend stays the single
+    source of truth; no separate operator store. Only successfully generated
+    trips exist as rows (failed generation rolls the row back), and each
+    entry carries the full canonical state plus traveler identity plus the
+    operator lifecycle gate (``lifecycle`` / ``operator_actionable``):
+    planning/draft rows are Preview-only (Pending Traveler Confirmation),
+    confirmed rows are actionable (Pending Operator Assignment), ongoing
+    rows are Active tours. Confirmation bumps updated_at, so the operator
+    3s sync-version poll observes traveler confirmation immediately.
+    Requires a verified operator/admin session (401/403 otherwise).
+    """
+    _ = current
+    query = db.query(Trip)
+    if status:
+        query = query.filter(Trip.status == status)
+    if search:
+        like = f"%{search}%"
+        query = query.filter((Trip.title.ilike(like)) | (Trip.id.ilike(like)))
+    trips = query.order_by(Trip.updated_at.desc()).all()
+    result = []
+    for trip in trips:
+        body = _trip_dict(trip, db)
+        body["traveler"] = _operator_traveler_block(trip)
+        body.update(_operator_lifecycle_block(trip, db))
+        result.append(body)
+    return result
+
+
+@router.get("/ops/trips/{trip_id}")
+def ops_get_trip(trip_id: str,
+                 db: Session = Depends(get_db),
+                 current: User = Depends(get_current_operator)):
+    """One canonical trip for the Operator app (secure; 404 when unknown)."""
+    _ = current
+    trip = _trip_or_404(db, trip_id)
+    body = _trip_dict(trip, db)
+    body["traveler"] = _operator_traveler_block(trip)
+    body.update(_operator_lifecycle_block(trip, db))
+    return body
+
+
 @router.get("/operator/dashboard")
 def operator_dashboard(db: Session = Depends(get_db)):
     trips = db.query(Trip).all()
@@ -2359,18 +2467,33 @@ def operator_analytics(db: Session = Depends(get_db)):
 @router.post("/auth/operator-login")
 def operator_login(payload: Dict[str, Any] = Body(default={}), db: Session = Depends(get_db)):
     email, password = (payload.get("email") or "").strip().lower(), payload.get("password") or ""
-    configured_password = os.getenv("OPERATOR_LOGIN_PASSWORD")
+    # Single source of truth at REQUEST time: real process env wins
+    # (monkeypatch-friendly), Settings (repo-root .env) is the fallback.
+    # os.getenv alone could not see the .env because nothing ever loaded it
+    # into the process; Settings alone could not see monkeypatched values.
+    # Empty everywhere = fail-closed 503.
+    env_password = os.getenv("OPERATOR_LOGIN_PASSWORD")
+    configured_password = env_password if env_password is not None else settings.OPERATOR_LOGIN_PASSWORD
     if not configured_password:
         raise HTTPException(status_code=503, detail="Operator login is not configured")
     user = db.query(User).filter(User.email == email, User.role.in_(["operator", "admin"]), User.is_active == True).first()
     if not user or not secrets.compare_digest(password, configured_password):
         raise HTTPException(status_code=401, detail="Invalid operator credentials")
+    from backend.auth.service import issue_operator_token
+
     return {"success": True, "user": {"id": user.id, "email": user.email, "name": user.full_name,
-            "role": user.role, "operator_name": user.full_name}, "token": secrets.token_urlsafe(32)}
+            "role": user.role, "operator_name": user.full_name}, "token": issue_operator_token(user.id)}
 
 
 def _commit_trip(db: Session, trip: Trip, action: str, field: str, value: str, reason: str) -> Dict[str, Any]:
     _record_change(db, trip, action, field, value, reason)
+    # Item-level mutations (transport/stay/activity changes) don't touch the
+    # Trip row itself, so onupdate would not fire — stamp explicitly so the
+    # operator sync-version poll observes every canonical state change.
+    try:
+        trip.updated_at = datetime.utcnow()
+    except Exception:
+        pass
     db.commit(); db.refresh(trip)
     return _trip_dict(trip, db)
 
