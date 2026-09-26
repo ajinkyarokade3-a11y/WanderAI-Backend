@@ -200,8 +200,38 @@ def test_budget_shortfall_names_cheapest_workable_total():
     })
     assert r.status_code == 422, r.text
     detail = r.json()["detail"]
+    assert "too low" in detail
     assert "cheapest workable plan" in detail
     assert "55,000" in detail
+
+
+def test_dateless_creation_warns_gently():
+    """Missing dates are a notice on success, never a failure."""
+    manali_id = client.get("/api/destinations/manali").json()["id"]
+    r = client.post("/api/trips", json={
+        "title": "Dateless Check",
+        "destination_id": manali_id,
+        "duration_days": 2,
+        "traveler_count": 1,
+        "total_budget": 30000.0,
+        "currency": "INR",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert any("No travel dates" in w for w in body.get("warnings", []))
+    dated = client.post("/api/trips", json={
+        "title": "Dated Check",
+        "destination_id": manali_id,
+        "duration_days": 2,
+        "traveler_count": 1,
+        "total_budget": 30000.0,
+        "currency": "INR",
+        "start_date": "2026-11-01T00:00:00",
+        "end_date": "2026-11-02T00:00:00",
+    })
+    assert dated.json().get("warnings") == []
+    client.delete(f"/api/trips/{body['id']}")
+    client.delete(f"/api/trips/{dated.json()['id']}")
 
 
 def _end_minutes(value):
