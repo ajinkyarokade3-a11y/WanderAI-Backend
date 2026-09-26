@@ -14,6 +14,9 @@ from backend.models.models import (
     Alert,
     ChangeHistory,
     Review,
+    TripApproval,
+    TripMessage,
+    TravelerOperatorChatMessage,
     GuideMessage,
     GuideConversationSummary,
 )
@@ -34,6 +37,9 @@ __all__ = [
     "Alert",
     "ChangeHistory",
     "Review",
+    "TripApproval",
+    "TripMessage",
+    "TravelerOperatorChatMessage",
     "GuideMessage",
     "GuideConversationSummary",
 ]

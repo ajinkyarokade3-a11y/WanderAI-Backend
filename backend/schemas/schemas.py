@@ -748,6 +748,27 @@ class TripMessageOverviewEntry(BaseModel):
     latest_at: Optional[str] = None
 
 
+class OperatorChatMessageCreate(BaseModel):
+    """One traveler<->operator chat message. sender identity is NEVER read
+    from this payload — the backend derives it from the auth session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    body: str = Field(min_length=1, max_length=2000)
+
+
+class OperatorChatMessageRead(BaseModel):
+    id: str
+    trip_id: str
+    sender_type: str
+    sender_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    body: str
+    is_read: bool = False
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 class ServiceAssignmentState(BaseModel):
     assigned: bool = False
     status: str = "pending"

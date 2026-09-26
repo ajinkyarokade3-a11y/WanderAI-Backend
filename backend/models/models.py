@@ -248,6 +248,11 @@ class Trip(Base):
     notifications = relationship("Notification", back_populates="trip", cascade="all, delete-orphan")
     change_history = relationship("ChangeHistory", back_populates="trip", order_by="ChangeHistory.timestamp.desc()", cascade="all, delete-orphan")
     reviews = relationship("Review", back_populates="trip", cascade="all, delete-orphan")
+    # Bidirectional traveler<->operator chat (separate from internal TripMessage).
+    operator_chat_messages = relationship(
+        "TravelerOperatorChatMessage", back_populates="trip",
+        order_by="TravelerOperatorChatMessage.created_at",
+        cascade="all, delete-orphan")
 
 
 class TripPreference(Base):
@@ -527,6 +532,34 @@ class TripMessage(Base):
     is_urgent = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TravelerOperatorChatMessage(Base):
+    """Bidirectional traveler <-> operator chat for one trip. Many rows per trip.
+
+    Deliberately SEPARATE from TripMessage (internal operator notes, which
+    stay traveler-invisible): this table is the single shared conversation
+    both sides read/write. sender_type is always server-derived from the
+    authenticated session ("traveler" | "operator"); sender_id is the
+    authenticated user id — never trusted from the client body.
+    """
+
+    __tablename__ = "traveler_operator_chat_messages"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    trip_id = Column(String(36), ForeignKey("trips.id", ondelete="CASCADE"), nullable=False, index=True)
+    # "traveler" | "operator"
+    sender_type = Column(String(20), nullable=False, index=True)
+    sender_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    sender_name = Column(String(255), nullable=True)
+    body = Column(Text, nullable=False)
+    # Per-recipient read tracking: "traveler" | "operator" | "both" | "none".
+    read_by = Column(String(20), nullable=False, default="none")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    trip = relationship("Trip", back_populates="operator_chat_messages")
+    sender = relationship("User")
 
 
 # ---------------------------------------------------------------------------
