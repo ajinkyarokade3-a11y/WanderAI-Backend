@@ -37,6 +37,17 @@ from backend.ai.cascade import (
     generate_via_openrouter,
 )
 from backend.ai.router import PROVIDER_PRIORITY_ORDER, generate_with_failover
+from backend.ai.extraction import (
+    EXTRACTION_SCHEMA,
+    EXTRACTION_SYSTEM_PROMPT,
+    build_extraction_request,
+    extract_travel_preferences,
+    parse_extraction_response,
+)
+from backend.ai.disruption_analysis import (
+    DISRUPTION_ANALYSIS_SCHEMA,
+    analyze_disruption,
+)
 from backend.ai.health import (
     ErrorRecord,
     HealthManager,
@@ -85,6 +96,13 @@ __all__ = [
     "generate_via_openrouter",
     "PROVIDER_PRIORITY_ORDER",
     "generate_with_failover",
+    "EXTRACTION_SCHEMA",
+    "EXTRACTION_SYSTEM_PROMPT",
+    "build_extraction_request",
+    "extract_travel_preferences",
+    "parse_extraction_response",
+    "DISRUPTION_ANALYSIS_SCHEMA",
+    "analyze_disruption",
     "ErrorRecord",
     "HealthManager",
     "HealthStore",

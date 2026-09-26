@@ -138,6 +138,11 @@ class GeminiAdapter(BaseProviderAdapter):
             )
             # Same config keys the existing code passes; omit Nones so the
             # request matches legacy behavior (plain-text call => no config).
+            # NOTE: response_schema is intentionally NOT passed to the Gemini
+            # SDK — several models reject it with a 400 (classified as
+            # UNKNOWN_ERROR), which burns the entire failover chain. The
+            # caller's json_object fallback (response_mime_type only) is the
+            # reliable path for Gemini structured output.
             config: dict = {}
             if request.temperature is not None:
                 config["temperature"] = request.temperature

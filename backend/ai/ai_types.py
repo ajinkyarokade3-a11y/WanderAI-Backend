@@ -54,6 +54,7 @@ class AIErrorCategory(str, Enum):
 
     RATE_LIMITED = "rate_limited"
     QUOTA_EXCEEDED = "quota_exceeded"
+    MODEL_QUOTA_EXCEEDED = "model_quota_exceeded"
     INVALID_API_KEY = "invalid_api_key"
     AUTHENTICATION_ERROR = "authentication_error"
     MODEL_UNAVAILABLE = "model_unavailable"
@@ -108,12 +109,19 @@ class AIRequest:
     inline their system instructions into the prompt string; ``system_instruction``
     is a separate optional field so OpenAI-compatible providers can send a
     real ``system`` message while Gemini concatenates it (same text either way).
+
+    ``response_schema`` is an optional JSON Schema dict. When set:
+    - Gemini receives it as ``response_schema`` in the config (strict mode).
+    - OpenRouter/Grok receive it as ``response_format: {type: json_schema, ...}``.
+    When ``None`` but ``response_mime_type`` is ``"application/json"``, providers
+    fall back to ``json_object`` mode (no strict schema enforcement).
     """
 
     prompt: str
     system_instruction: Optional[str] = None
     temperature: Optional[float] = None
     response_mime_type: Optional[str] = None  # "application/json" or None
+    response_schema: Optional[dict[str, Any]] = None  # JSON Schema for structured output
     max_output_tokens: Optional[int] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None

@@ -148,6 +148,13 @@ _DIRECTIVES: dict[AIErrorCategory, FailoverDirective] = {
         cooldown_key=True,  # long key cooldown (durations live in FailoverPlan)
         reason="Quota/billing exhausted on this key: try the next key.",
     ),
+    AIErrorCategory.MODEL_QUOTA_EXCEEDED: FailoverDirective(
+        action=FailoverAction.NEXT_MODEL,
+        cooldown_model=True,  # cool the quota-exhausted model only
+        retryable=False,  # same model+key is quota-blocked: move to next model
+        reason="Per-model quota exhausted (Gemini free tier): the SAME key "
+               "still works for other models, so try the next model.",
+    ),
     AIErrorCategory.INVALID_API_KEY: FailoverDirective(
         action=FailoverAction.NEXT_KEY,
         cooldown_key=True,
@@ -235,6 +242,11 @@ _QUOTA_WORDS = (
     "spend limit",
     "spending limit",
 )
+# Gemini per-model quota errors name the specific model (e.g. "model: gemini-3.6-flash").
+# These are model-scoped, not key-scoped: the SAME key still works for other models,
+# so the cascade must try NEXT_MODEL (same key) rather than NEXT_KEY (which wastes
+# keys 2/3 on an identical quota wall, then falls off the provider entirely).
+_MODEL_QUOTA_PATTERN = "model:"
 _KEY_WORDS = (
     "invalid api key",
     "api_key_invalid",
@@ -280,8 +292,16 @@ def classify_http(status: Optional[int], message: str) -> AIErrorCategory:
     # 2. Rate-limit / quota.
     if status == 429 or "resource_exhausted" in msg or "rate_limit" in msg or "rate limit" in msg or "too many requests" in msg or " 429" in msg:
         if status == 429 and any(w in msg for w in _QUOTA_WORDS):
+            # Per-model quota (Gemini free tier): the message names the model,
+            # e.g. "Quota exceeded ... model: gemini-3.6-flash". This is a
+            # model-scoped wall — the SAME key still works for other models,
+            # so the cascade must try NEXT_MODEL, not NEXT_KEY.
+            if _MODEL_QUOTA_PATTERN in msg:
+                return AIErrorCategory.MODEL_QUOTA_EXCEEDED
             return AIErrorCategory.QUOTA_EXCEEDED
         if "resource_exhausted" in msg and any(w in msg for w in _QUOTA_WORDS):
+            if _MODEL_QUOTA_PATTERN in msg:
+                return AIErrorCategory.MODEL_QUOTA_EXCEEDED
             return AIErrorCategory.QUOTA_EXCEEDED
         return AIErrorCategory.RATE_LIMITED
     if status == 402 or (any(w in msg for w in ("billing", "credit", "insufficient")) and "model" not in msg):

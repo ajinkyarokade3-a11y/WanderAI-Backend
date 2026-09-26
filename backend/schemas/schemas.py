@@ -848,6 +848,52 @@ class AIReplanRequest(BaseModel):
     trigger_event: Dict[str, Any]
 
 
+class DisruptionAnalysisRequest(BaseModel):
+    """Request body for disruption impact analysis.
+
+    If ``alert_id`` is provided, the analysis uses that specific alert.
+    Otherwise the most recent unresolved alert is used.
+    If ``disruption`` is provided in the payload, it overrides the alert data.
+    """
+    alert_id: Optional[str] = None
+    disruption: Optional[Dict[str, Any]] = None
+
+
+class DisruptionAlternative(BaseModel):
+    """One AI-suggested alternative activity, pending operator approval."""
+    activity_id: str
+    title: str
+    location: Optional[str] = None
+    cost: float
+    currency: str = "INR"
+    duration_hours: Optional[float] = None
+    rationale: str
+    estimated_time_impact: Optional[str] = None
+    estimated_cost_impact: Optional[float] = None
+    risks: List[str] = []
+
+
+class DisruptionAnalysisResponse(BaseModel):
+    """Full disruption impact analysis with AI-suggested alternatives."""
+    trip_id: str
+    analysis_id: str
+    disruption_cause: str
+    affected_day: Optional[int] = None
+    affected_activity: Optional[str] = None
+    severity: str
+    impact_summary: str
+    affected_items: List[Dict[str, Any]] = []
+    affected_bookings: List[Dict[str, Any]] = []
+    affected_vendors: List[Dict[str, Any]] = []
+    transport_changes: List[Dict[str, Any]] = []
+    alternatives: List[DisruptionAlternative] = []
+    estimated_schedule_impact: Optional[str] = None
+    estimated_cost_impact: Optional[float] = None
+    risks_limitations: List[str] = []
+    source: str = "ai"
+    status: str = "pending_approval"
+
+
 # Destination research agent schemas.  These deliberately describe research
 # context rather than a Trip/TripState, because research is read-only input to
 # later planning workflows.

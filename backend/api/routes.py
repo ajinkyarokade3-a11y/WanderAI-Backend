@@ -40,6 +40,7 @@ from backend.schemas.schemas import (
     AddRestaurantRequest, RestaurantItemRead,
 )
 from backend.ai.gemini_service import gemini_service
+from backend.ai.ai_types import AIProviderError
 from backend.research.service import DestinationResearchService, ResearchExecutionError
 from backend.accommodation.service import AccommodationRecommendationService, AccommodationExecutionError
 from backend.transportation.service import TransportationRecommendationService, TransportationExecutionError
@@ -58,6 +59,8 @@ from backend.dynamic_destination.service import DynamicDestinationDiscoveryError
 from backend.itinerary.generator import ItineraryGenerationError, ItineraryGenerator
 from backend.auth.service import get_current_operator
 from backend.replanning.engine import ReplanningEngine
+from backend.ai.disruption_analysis import analyze_disruption
+from backend.schemas.schemas import DisruptionAnalysisRequest
 import logging
 import os
 import re
@@ -2607,6 +2610,104 @@ def apply_replan(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: S
     db.commit(); db.refresh(trip)
     return {"success": True, "summary": {"new_activity": activity.title,
             "booking_reference": None, "cost_savings": 0}, "trip": _trip_dict(trip, db)}
+
+
+@router.post("/trips/{trip_id}/disruption-analysis")
+def disruption_analysis(trip_id: str, payload: DisruptionAnalysisRequest = Body(default=...),
+                        db: Session = Depends(get_db)):
+    """Analyze disruption impact and generate AI-powered alternative plans.
+
+    Returns a comprehensive analysis including:
+    - disruption cause
+    - affected day/activity
+    - severity/impact
+    - affected bookings/vendors
+    - recommended alternatives (marked AI Suggested - Pending Approval)
+    - replacement activity/location
+    - transport changes if required
+    - estimated time/cost impact
+    - risks/limitations
+
+    Does NOT modify the itinerary. Use /apply-replan to apply a suggestion
+    or /dismiss-disruption to reject.
+    """
+    trip = _trip_or_404(db, trip_id)
+
+    # Determine the disruption source
+    disruption = payload.disruption if payload.disruption else None
+    if not disruption:
+        # Use the most recent unresolved alert
+        if payload.alert_id:
+            alert = db.query(Alert).filter(
+                Alert.id == payload.alert_id, Alert.trip_id == trip.id
+            ).first()
+            if not alert:
+                raise HTTPException(status_code=404, detail="Alert not found")
+        else:
+            alert = db.query(Alert).filter(
+                Alert.trip_id == trip.id, Alert.is_resolved == False  # noqa: E712
+            ).order_by(Alert.created_at.desc()).first()
+
+        if alert:
+            disruption = {
+                "type": alert.alert_type,
+                "severity": alert.severity,
+                "title": alert.title,
+                "description": alert.description,
+            }
+
+    if not disruption:
+        # No disruption data available — use a generic disruption
+        disruption = {
+            "type": "weather",
+            "severity": "warning",
+            "title": "Operational disruption reported",
+            "description": "A disruption was reported and requires itinerary review.",
+        }
+
+    try:
+        analysis = analyze_disruption(db, trip, disruption)
+    except AIProviderError as exc:
+        raise HTTPException(status_code=502, detail=exc.public_message) from exc
+
+    # Record that analysis was generated
+    _record_change(
+        db, trip, "disruption_analysis_generated", "alerts",
+        analysis.get("disruption_cause", "Disruption analysis"),
+        f"AI generated {len(analysis.get('alternatives', []))} alternative(s) for operator review.",
+        "ai",
+    )
+    db.commit()
+
+    return analysis
+
+
+@router.post("/trips/{trip_id}/dismiss-disruption")
+def dismiss_disruption(trip_id: str, payload: Dict[str, Any] = Body(default={}),
+                       db: Session = Depends(get_db)):
+    """Dismiss/reject a disruption without changing the itinerary.
+
+    Resolves all unresolved alerts and records the dismissal in the audit log.
+    The itinerary remains unchanged.
+    """
+    trip = _trip_or_404(db, trip_id)
+
+    unresolved = [a for a in trip.alerts if not a.is_resolved]
+    if not unresolved:
+        return {"success": True, "message": "No unresolved alerts to dismiss"}
+
+    for alert in unresolved:
+        alert.is_resolved = True
+
+    _record_change(
+        db, trip, "disruption_dismissed", "alerts",
+        "Disruption dismissed",
+        payload.get("reason") or "Operator dismissed the disruption without itinerary changes.",
+        "operator",
+    )
+    db.commit()
+
+    return {"success": True, "message": "Disruption dismissed. Itinerary unchanged."}
 
 
 def _set_trip_request_status(trip_id: str, status: str, db: Session):
