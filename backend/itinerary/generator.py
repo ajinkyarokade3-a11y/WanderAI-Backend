@@ -70,11 +70,14 @@ class ItineraryGenerator:
         if estimate is None:
             return exc
         cur = (trip.currency or "INR").upper()
+        total = float(trip.total_budget or 0)
+        travelers = max(1, int(trip.traveler_count or 1))
+        days = max(1, int(trip.duration_days or 1))
         return ItineraryGenerationError(
-            f"{exc} (cheapest workable plan ≈ {cur} {estimate:,.0f} for "
-            f"{max(1, int(trip.traveler_count or 1))} traveler(s), "
-            f"{max(1, int(trip.duration_days or 1))} days — "
-            "raise the budget or shorten the trip)."
+            f"Your budget of {cur} {total:,.0f} is too low for {travelers} "
+            f"traveler(s) over {days} days — cheapest workable plan ≈ "
+            f"{cur} {estimate:,.0f} (stays, transfers and activities included). "
+            "Raise the budget or shorten the trip."
         )
 
     def minimum_viable_estimate(self, trip: Trip) -> Optional[float]:
@@ -306,7 +309,11 @@ class ItineraryGenerator:
             selected_activity_ids.add(activity.id)
             remaining_budget = self._subtract_budget(remaining_budget, cost)
         if len(selected_activities) < required_activity_days:
-            raise ItineraryGenerationError("Not enough distinct active catalog activities fit the requested duration and budget")
+            raise ItineraryGenerationError(
+                f"Only {len(selected_activities)} affordable distinct activities found, "
+                f"but {required_activity_days} are needed for {self._duration_days(trip)} days — "
+                "raise the budget (cheapest picks go first) or shorten the trip."
+            )
 
         occupied_orders = {(item.day_number, item.order_index) for item in preserved_items}
         # New stops also occupy orders so same-day items never collide.

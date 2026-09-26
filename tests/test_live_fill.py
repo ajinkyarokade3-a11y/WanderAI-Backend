@@ -392,6 +392,29 @@ def test_commons_name_fallback_and_radius_cap(monkeypatch):
     assert out["places"][0]["image_url"] == "https://upload.wikimedia.org/x.jpg"
 
 
+def test_validator_speaks_plainly(monkeypatch):
+    """Inventory gaps read like a reason, not catalog jargon."""
+    import backend.places.service as places_service
+    from backend.database.config import settings
+
+    monkeypatch.setattr(places_service, "get_live_places",
+                        lambda *a, **k: {"places": []})
+    monkeypatch.setattr(settings, "SERPAPI_API_KEY", "")
+    dest_id = _make_bare_destination(with_transport=True)
+    try:
+        r = client.post("/api/trips", json={
+            "title": "Plain Words", "destination_id": dest_id,
+            "duration_days": 3, "traveler_count": 2,
+            "total_budget": 50000.0, "currency": "INR"})
+        assert r.status_code == 422
+        detail = r.json()["detail"]
+        assert "Not enough saved for" in detail
+        assert "missing hotels" in detail
+        assert "Catalog inventory" not in detail
+    finally:
+        _delete_destination(dest_id)
+
+
 def test_fill_is_idempotent(_live_providers):
     from backend.live_fill.service import fill_destination_inventory
     dest_id = _make_bare_destination(with_transport=True)

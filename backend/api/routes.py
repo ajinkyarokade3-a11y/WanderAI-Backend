@@ -213,9 +213,11 @@ def _validate_generation_inventory(db: Session, destination: Destination, curren
     if activity_count < required_activities:
         missing.append(f"at least {required_activities} distinct activities")
     if missing:
+        # Plain-spoken: the UI shows this verbatim, so it must read like a
+        # reason ("not enough saved yet"), not catalog jargon.
         raise HTTPException(
             status_code=422,
-            detail=f"Catalog inventory for {destination.name} is incomplete: missing {', '.join(missing)}",
+            detail=f"Not enough saved for {destination.name} yet: missing {', '.join(missing)}.",
         )
 
 
@@ -1729,7 +1731,17 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     db.refresh(trip)
-    return _trip_dict(trip, db)
+    result = _trip_dict(trip, db)
+    # Non-blocking notices (never failures): dates drive day planning, so
+    # their absence is worth one gentle line in the UI, not an error.
+    warnings = []
+    if not trip.start_date or not trip.end_date:
+        warnings.append(
+            f"No travel dates set — itinerary assumes {trip.duration_days} day(s). "
+            "Add dates for exact day planning."
+        )
+    result["warnings"] = warnings
+    return result
 
 @router.get("/trips/{trip_id}")
 def get_trip(trip_id: str, db: Session = Depends(get_db)):
