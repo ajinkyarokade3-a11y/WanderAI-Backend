@@ -34,8 +34,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for Frontend communication
-ALLOWED_ORIGINS = ["*", "http://localhost:3001"]
+# Enable CORS for Frontend communication (explicit dev origins only —
+# wildcard "*" must never be combined with allow_credentials=True).
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3002",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -56,7 +64,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Unhandled error on {request.url.path}: {exc}")
     origin = request.headers.get("origin")
     cors_headers = {}
-    if origin and ("*" in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS):
+    if origin and origin in ALLOWED_ORIGINS:
         cors_headers["Access-Control-Allow-Origin"] = origin
         cors_headers["Access-Control-Allow-Credentials"] = "true"
         cors_headers["Vary"] = "Origin"
