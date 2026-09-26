@@ -2070,6 +2070,105 @@ def create_trip_message(
     return _message_dict(row)
 
 
+# ---------------------------------------------------------------------------
+# Traveler <-> operator chat (bidirectional; isolated from internal TripMessage)
+#
+# Eligibility (canonical pipeline, no duplicate approval system):
+#   traveler-confirmed  = Trip.status in (confirmed, ongoing) AND confirmed_at set
+#   operator-accepted   = TripApproval.approved AND assignment_started
+#     (approved alone is NOT enough: accept flips confirmed -> ongoing and is
+#     the "operator accepted" step the Operator-Web acceptTripAssignment()
+#     performs; finalized trips keep chat readable)
+# ---------------------------------------------------------------------------
+
+CHAT_BODY_MAX_LENGTH = 2000
+
+CHAT_DISABLED_TRAVELER_PENDING = "waiting_for_traveler_confirmation"
+CHAT_DISABLED_OPERATOR_PENDING = "waiting_for_operator_acceptance"
+
+
+def _chat_approval(db: Session, trip_id: str):
+    return (
+        db.query(TripApproval)
+        .filter(TripApproval.trip_id == str(trip_id or "").strip())
+        .first()
+    )
+
+
+def chat_status(db: Session, trip: Trip) -> Dict[str, Any]:
+    """Machine-readable chat availability for one trip (no sensitive data)."""
+    status = (getattr(trip, "status", None) or "").strip().lower()
+    traveler_confirmed = status in ("confirmed", "ongoing") and bool(
+        getattr(trip, "confirmed_at", None)
+    )
+    if not traveler_confirmed:
+        return {
+            "enabled": False,
+            "state": CHAT_DISABLED_TRAVELER_PENDING,
+            "traveler_confirmed": False,
+            "operator_accepted": False,
+        }
+    approval = _chat_approval(db, trip.id)
+    operator_accepted = bool(
+        approval is not None and approval.approved and approval.assignment_started
+    )
+    if not operator_accepted:
+        return {
+            "enabled": False,
+            "state": CHAT_DISABLED_OPERATOR_PENDING,
+            "traveler_confirmed": True,
+            "operator_accepted": False,
+        }
+    return {
+        "enabled": True,
+        "state": "active",
+        "traveler_confirmed": True,
+        "operator_accepted": True,
+    }
+
+
+def _require_chat_message_body(body: Any) -> str:
+    cleaned = str(body or "").strip()
+    if not cleaned:
+        raise OpsValidation("body is required")
+    if len(cleaned) > CHAT_BODY_MAX_LENGTH:
+        raise OpsValidation(
+            f"body must be at most {CHAT_BODY_MAX_LENGTH} characters"
+        )
+    return cleaned
+
+
+def _chat_message_dict(row) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "trip_id": row.trip_id,
+        "sender_type": row.sender_type,
+        "sender_id": row.sender_id,
+        "sender_name": row.sender_name,
+        "body": row.body,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def can_access_traveler_operator_chat(
+    db: Session, trip: Trip, actor: str, actor_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Single gate: eligibility + actor authorization (traveler owns / operator)."""
+    cleaned_actor = (actor or "").strip().lower()
+    if cleaned_actor == "traveler":
+        if not actor_id or str(actor_id) != str(trip.user_id):
+            raise OpsForbidden("Trip does not belong to this traveler")
+    elif cleaned_actor == "operator":
+        pass  # any verified operator/admin may handle canonical trips
+    else:
+        raise OpsValidation("actor must be traveler or operator")
+    status = chat_status(db, trip)
+    if not status["enabled"]:
+        raise OpsConflict(f"Chat is not available: {status['state']}")
+    return status
+
+
 def trip_messages_overview(db: Session) -> List[Dict[str, Any]]:
     """Per-trip message counts for the communications trip list."""
     from sqlalchemy import case, func
@@ -2095,3 +2194,172 @@ def trip_messages_overview(db: Session) -> List[Dict[str, Any]]:
             }
         )
     return overview
+
+
+def _chat_participants(db: Session, trip: Trip) -> Dict[str, Any]:
+    from backend.models.models import User as _User
+
+    traveler = db.query(_User).filter(_User.id == trip.user_id).first()
+    return {
+        "traveler": {
+            "id": trip.user_id,
+            "name": traveler.full_name if traveler else None,
+        },
+        "operator": {"id": None, "name": "Operations team"},
+    }
+
+
+def _chat_messages_for(db: Session, trip_id: str, viewer: str) -> List[Dict[str, Any]]:
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
+    rows = (
+        db.query(_Chat)
+        .filter(_Chat.trip_id == str(trip_id or "").strip())
+        .order_by(_Chat.created_at.asc(), _Chat.id.asc())
+        .all()
+    )
+    out = []
+    for row in rows:
+        item = _chat_message_dict(row)
+        item["is_read"] = bool(
+            row.sender_type == viewer or (row.read_by or "") in (viewer, "both")
+        )
+        out.append(item)
+    return out
+
+
+def _mark_chat_read(db: Session, trip_id: str, viewer: str) -> None:
+    """Mark incoming messages as read by the viewing side (idempotent)."""
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
+    rows = (
+        db.query(_Chat)
+        .filter(_Chat.trip_id == str(trip_id or "").strip())
+        .filter(_Chat.sender_type != viewer)
+        .all()
+    )
+    changed = False
+    for row in rows:
+        read_by = (row.read_by or "none").strip().lower()
+        if read_by in ("both", viewer):
+            continue
+        other = "operator" if viewer == "traveler" else "traveler"
+        row.read_by = "both" if read_by == other else viewer
+        changed = True
+    if changed:
+        db.commit()
+
+
+def _chat_unread_count(db: Session, trip_id: str, viewer: str) -> int:
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
+    rows = (
+        db.query(_Chat)
+        .filter(_Chat.trip_id == str(trip_id or "").strip())
+        .filter(_Chat.sender_type != viewer)
+        .all()
+    )
+    return sum(
+        1 for row in rows if (row.read_by or "none") not in (viewer, "both")
+    )
+
+
+def _chat_summary(db: Session, trip: Trip, viewer: str) -> Dict[str, Any]:
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
+    status = chat_status(db, trip)
+    messages = _chat_messages_for(db, trip.id, viewer) if status["enabled"] else []
+    latest = messages[-1] if messages else None
+    count = (
+        db.query(_Chat).filter(_Chat.trip_id == trip.id).count()
+        if status["enabled"]
+        else 0
+    )
+    unread = _chat_unread_count(db, trip.id, viewer) if status["enabled"] else 0
+    summary: Dict[str, Any] = {
+        "trip_id": trip.id,
+        "enabled": status["enabled"],
+        "state": status["state"],
+        "traveler": _chat_participants(db, trip)["traveler"],
+        "operator": _chat_participants(db, trip)["operator"],
+        "messages": messages,
+        "message_count": count,
+        "unread_count": unread,
+        "latest_message": latest,
+    }
+    if not status["enabled"]:
+        summary["reason"] = status["state"]
+    return summary
+
+
+def get_traveler_chat(db: Session, trip: Trip, viewer: str = "traveler") -> Dict[str, Any]:
+    """Read the shared conversation (marks incoming as read)."""
+    status = chat_status(db, trip)
+    if not status["enabled"]:
+        raise OpsConflict(f"Chat is not available: {status['state']}")
+    summary = _chat_summary(db, trip, viewer)
+    _mark_chat_read(db, trip.id, viewer)
+    summary["messages"] = _chat_messages_for(db, trip.id, viewer)
+    summary["unread_count"] = 0
+    return summary
+
+
+def post_chat_message(
+    db: Session,
+    trip: Trip,
+    sender_type: str,
+    sender_id: Optional[str],
+    sender_name: Optional[str],
+    body: Any,
+) -> Dict[str, Any]:
+    """Persist one chat message as the authenticated side (chronological)."""
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
+    status = chat_status(db, trip)
+    if not status["enabled"]:
+        raise OpsConflict(f"Chat is not available: {status['state']}")
+    cleaned_type = (sender_type or "").strip().lower()
+    if cleaned_type not in ("traveler", "operator"):
+        raise OpsValidation("sender_type must be traveler or operator")
+    cleaned_body = _require_chat_message_body(body)
+    row = _Chat(
+        trip_id=trip.id,
+        sender_type=cleaned_type,
+        sender_id=(str(sender_id).strip() or None) if sender_id else None,
+        sender_name=(str(sender_name or "").strip() or None),
+        body=cleaned_body,
+        read_by="none",
+    )
+    db.add(row)
+    _bump_trip_version(db, trip)
+    db.commit()
+    db.refresh(row)
+    item = _chat_message_dict(row)
+    item["is_read"] = True
+    return item
+
+
+def chat_overview_for_operator(db: Session) -> List[Dict[str, Any]]:
+    """Chat-eligible trips with latest-message/unread preview (operator list)."""
+    trips = db.query(Trip).order_by(Trip.updated_at.desc()).all()
+    out = []
+    for trip in trips:
+        status = chat_status(db, trip)
+        if not status["enabled"]:
+            continue
+        messages = _chat_messages_for(db, trip.id, "operator")
+        latest = messages[-1] if messages else None
+        out.append(
+            {
+                "trip_id": trip.id,
+                "title": trip.title,
+                "status": trip.status,
+                "traveler": _chat_participants(db, trip)["traveler"],
+                "message_count": len(messages),
+                "unread_count": _chat_unread_count(db, trip.id, "operator"),
+                "latest_message": latest,
+                "latest_at": latest["created_at"] if latest else None,
+            }
+        )
+    return out
+

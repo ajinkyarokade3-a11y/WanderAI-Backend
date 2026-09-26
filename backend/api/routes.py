@@ -31,6 +31,7 @@ from backend.schemas.schemas import (
     TripApprovalRequest, TripApprovalRead, TripPipelineResponse,
     TripFinalizeRequest, TripFinalizeResponse,
     TripMessageCreate, TripMessageRead, TripMessageOverviewEntry,
+    OperatorChatMessageCreate, OperatorChatMessageRead,
     TravelerSignupRequest, TravelerLoginRequest, TravelerRead, TravelerAuthResponse,
     TravelerTripSaveRequest, TravelerTripSaveResponse, TravelerTripSummary,
     TravelerProfileResponse, TravelerProfileUpdate, TravelerPreferencesRead, TravelerPreferencesUpdate,
@@ -228,6 +229,51 @@ def _record_change(db: Session, trip: Trip, action: str, field: str, value: str,
                          field_changed=field, new_value=value, reason=reason))
 
 
+# ---------------------------------------------------------------------------
+# Trip date/duration convention (single authoritative rule).
+#
+# The application counts INCLUSIVE calendar days:
+#     duration_days = (end_date.date() - start_date.date()).days + 1
+# i.e. 27 Sep -> 01 Oct is 5 days. Generation, validation, route-day dates
+# and the review-screen helper below all share this rule, so the frontend's
+# "5 days" always matches the backend's interpretation of the final dates.
+# ---------------------------------------------------------------------------
+def _trip_duration_from_dates(start: Any, end: Any) -> int:
+    """Inclusive day count for two datetimes/dates. Raises ValueError when
+    either side is missing (callers decide the fallback)."""
+    start_day = start.date() if isinstance(start, datetime) else start
+    end_day = end.date() if isinstance(end, datetime) else end
+    if start_day is None or end_day is None:
+        raise ValueError("Both start_date and end_date are required")
+    return max(1, (end_day - start_day).days + 1)
+
+
+def _parse_review_date(value: Any) -> Optional[date_cls]:
+    """Parse a frontend date-only value (YYYY-MM-DD, DD-MM-YYYY, datetime).
+
+    Returns None for missing/blank; raises HTTPException 422 for malformed.
+    Uses date objects (never string arithmetic).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date_cls):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=422,
+        detail=f"Invalid date '{text}': expected YYYY-MM-DD (e.g. 2026-09-27)",
+    )
+
+
 def _hotel_option(hotel: Hotel, trip: Trip, badge: str) -> Dict[str, Any]:
     """Build a frontend AccommodationOption-shaped dict from a catalog Hotel row.
 
@@ -380,6 +426,14 @@ def _trip_dict(trip: Trip, db: Session) -> Dict[str, Any]:
                     _clat, _clng = item.activity.latitude, item.activity.longitude
                 elif item.transport is not None:
                     _clat, _clng = item.transport.latitude, item.transport.longitude
+                if (_clat is None or _clng is None) and getattr(item, "activity_id", None) is None \
+                        and (item.title or "").strip() and getattr(trip, "destination_id", None):
+                    _match = db.query(Activity).filter(
+                        Activity.destination_id == trip.destination_id,
+                        Activity.title.ilike((item.title or "").strip()),
+                    ).first()
+                    if _match is not None:
+                        _clat, _clng = _match.latitude, _match.longitude
                 _clat, _clng = float(_clat), float(_clng)
                 if not (-90 <= _clat <= 90 and -180 <= _clng <= 180):
                     raise ValueError
@@ -1455,6 +1509,107 @@ def ops_create_trip_message(
 
 
 # ----------------------------------------------------
+# Traveler <-> operator chat (bidirectional, trip-scoped).
+#
+# One canonical conversation per trip in the isolated
+# traveler_operator_chat_messages table — internal TripMessage rows stay
+# traveler-invisible. Traveler identity comes from the traveler JWT;
+# operator identity from the operator session. Chat is gated on the
+# canonical pipeline: traveler-confirmed AND operator-accepted
+# (approved + assignment_started). REST polling (GET + POST + refetch).
+# ----------------------------------------------------
+def _chat_trip_or_404(db: Session, trip_id: str) -> Trip:
+    from backend.ops.service import _require_trip_id as _clean_trip_id
+
+    trip = db.query(Trip).filter(Trip.id == _clean_trip_id(trip_id)).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    return trip
+
+
+def _chat_actor_from_request(request: Request, db: Session) -> tuple:
+    """Return (role, user) for whichever valid session the request carries.
+
+    Traveler JWT wins when both are somehow present; raises 401 when neither
+    session is valid. Role strings match the chat sender_type values.
+    """
+    from backend.auth.service import get_current_operator, get_current_traveler
+
+    try:
+        return "traveler", get_current_traveler(request, db)
+    except HTTPException:
+        pass
+    try:
+        return "operator", get_current_operator(request, db)
+    except HTTPException:
+        pass
+    raise HTTPException(status_code=401, detail="authentication required")
+
+
+@router.get("/trips/{trip_id}/chat")
+def get_trip_chat(trip_id: str, request: Request, db: Session = Depends(get_db)):
+    """Shared conversation for the authenticated participant.
+
+    Travelers only see their own trips (404 otherwise, no existence leak).
+    """
+    from backend.ops.service import (
+        OpsConflict, OpsForbidden, can_access_traveler_operator_chat, get_traveler_chat,
+    )
+
+    role, user = _chat_actor_from_request(request, db)
+    trip = _chat_trip_or_404(db, trip_id)
+    try:
+        can_access_traveler_operator_chat(
+            db, trip, role, getattr(user, "id", None))
+    except OpsForbidden:
+        if role == "traveler":
+            raise HTTPException(status_code=404, detail="Trip not found")
+        raise HTTPException(status_code=403, detail="Not authorized for this trip")
+    except OpsConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise _ops_error(exc)
+    try:
+        return get_traveler_chat(db, trip, viewer=role)
+    except Exception as exc:
+        raise _ops_error(exc)
+
+
+@router.post("/trips/{trip_id}/chat/messages", response_model=OperatorChatMessageRead)
+def post_trip_chat_message(
+    trip_id: str, payload: OperatorChatMessageCreate,
+    request: Request, db: Session = Depends(get_db),
+):
+    """Send one message as the authenticated side. Body only — sender_type /
+    sender_id are derived from the session and cannot be spoofed."""
+    from backend.ops.service import (
+        OpsConflict, OpsForbidden, can_access_traveler_operator_chat, post_chat_message,
+    )
+
+    role, user = _chat_actor_from_request(request, db)
+    trip = _chat_trip_or_404(db, trip_id)
+    try:
+        can_access_traveler_operator_chat(
+            db, trip, role, getattr(user, "id", None))
+    except OpsForbidden:
+        if role == "traveler":
+            raise HTTPException(status_code=404, detail="Trip not found")
+        raise HTTPException(status_code=403, detail="Not authorized for this trip")
+    except OpsConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise _ops_error(exc)
+    try:
+        return post_chat_message(
+            db, trip, role, getattr(user, "id", None),
+            getattr(user, "full_name", None) or getattr(user, "email", None),
+            (payload.body or "").strip(),
+        )
+    except Exception as exc:
+        raise _ops_error(exc)
+
+
+# ----------------------------------------------------
 # Activities API
 # ----------------------------------------------------
 @router.get("/activities", response_model=List[ActivityRead])
@@ -1559,13 +1714,14 @@ def create_trip(trip_in: TripCreate, request: Request, db: Session = Depends(get
     # persisted catalog rather than accepting a disconnected frontend object.
     destination = _resolve_or_discover_destination(db, trip_in)
     duration_days = trip_in.duration_days or 4
-    # Dates are the source of truth: a 16-21 Oct range is 6 days even if the
-    # caller sent duration_days=3. Derive it so generation covers the range.
+    # Dates are the source of truth: a 16-21 Oct range is 6 inclusive days
+    # even if the caller sent duration_days=3. Derive it so generation
+    # covers the range. Manual end-date edits are accepted the same way —
+    # the final dates always win over any earlier duration.
     if trip_in.start_date and trip_in.end_date:
         if trip_in.end_date < trip_in.start_date:
             raise HTTPException(status_code=422, detail="Trip end date is before start date")
-        duration_days = max(
-            1, (trip_in.end_date.date() - trip_in.start_date.date()).days + 1)
+        duration_days = _trip_duration_from_dates(trip_in.start_date, trip_in.end_date)
     currency = trip_in.currency or "INR"
     traveler_count = trip_in.traveler_count or 2
     try:
@@ -1798,11 +1954,79 @@ def trip_map(trip_id: str, db: Session = Depends(get_db)):
         except (TypeError, ValueError):
             return None, None
 
+    def _heal_coords(item) -> tuple:
+        """Best-effort fallback for items stored without coordinates.
+
+        Uses the same resolver as add-activity (explicit > linked catalog >
+        destination title-match) plus Nominatim for legacy/unmapped items so
+        older custom stops and restaurant meals gain pins without a re-add.
+        Resolved pairs are persisted to ``meta_data.ui`` (self-healing read)
+        so repeat reads serve stored coordinates. Never raises;
+        (None, None) keeps the honest unmapped gap.
+        """
+        lat, lng = _coords(item)
+        if lat is not None:
+            return lat, lng
+        if getattr(item, "item_type", None) not in ("activity", "meal"):
+            return None, None
+        # Fast offline paths first (linked catalog, then destination
+        # title-match): these never touch the network.
+        catalog = getattr(item, "activity", None)
+        if catalog is None and getattr(item, "activity_id", None):
+            try:
+                catalog = db.query(Activity).filter(
+                    Activity.id == item.activity_id).first()
+            except Exception:
+                catalog = None
+        if catalog is None and (getattr(item, "title", "") or "").strip() \
+                and getattr(trip, "destination_id", None):
+            try:
+                catalog = db.query(Activity).filter(
+                    Activity.destination_id == trip.destination_id,
+                    Activity.title.ilike((item.title or "").strip()),
+                ).first()
+            except Exception:
+                catalog = None
+        if catalog is not None:
+            resolved = _valid_coords(getattr(catalog, "latitude", None),
+                                     getattr(catalog, "longitude", None))
+            if resolved:
+                lat, lng = resolved
+        if lat is None:
+            # Nominatim for genuinely unknown names; skipped (unmapped) when
+            # the provider is unreachable — one bad stop never breaks the map.
+            try:
+                from backend.places.service import geocode_place
+
+                dest_name = trip.destination.name if trip.destination else None
+                title = (getattr(item, "title", "") or "").strip()
+                query = f"{title}, {dest_name}" if dest_name else title
+                geo = geocode_place(query, settings.NOMINATIM_API_URL,
+                                    settings.PLACES_TIMEOUT_S) if query else None
+                if geo:
+                    resolved = _valid_coords(geo[0], geo[1])
+                    if resolved:
+                        lat, lng = resolved
+            except Exception:
+                return None, None
+        if lat is None:
+            return None, None
+        try:
+            meta = dict(getattr(item, "meta_data", None) or {})
+            ui = dict(meta.get("ui", {}) or {})
+            ui["latitude"] = lat
+            ui["longitude"] = lng
+            meta["ui"] = ui
+            item.meta_data = meta
+        except Exception:
+            pass
+        return lat, lng
+
     days: Dict[int, list] = {}
     unmapped = 0
     all_lat, all_lng = [], []
     for item in sorted(trip.itinerary, key=lambda i: (i.day_number, i.order_index)):
-        lat, lng = _coords(item)
+        lat, lng = _heal_coords(item)
         ok = lat is not None
         if ok:
             all_lat.append(lat)
@@ -1815,6 +2039,7 @@ def trip_map(trip_id: str, db: Session = Depends(get_db)):
             "location": item.location, "start_time": item.start_time,
             "end_time": item.end_time, "status": item.status,
             "latitude": lat, "longitude": lng, "has_coordinates": ok,
+            "activity_id": item.activity_id,
         })
     dest = trip.destination
     if all_lat:
@@ -1824,6 +2049,10 @@ def trip_map(trip_id: str, db: Session = Depends(get_db)):
         center = {"latitude": dest.latitude, "longitude": dest.longitude}
     else:
         center = None
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
     return {
         "trip_id": trip.id,
         "destination": {"name": dest.name if dest else None,
@@ -1844,6 +2073,10 @@ def update_trip(trip_id: str, trip_in: TripUpdate, db: Session = Depends(get_db)
     transitions: POST /trips/{id}/confirm (traveler) and
     POST /ops/trips/{id}/accept (operator). Direct status writes are ignored
     so unconfirmed trips stay Preview-only for operators.
+
+    Date/duration stay consistent under the inclusive convention: when the
+    update leaves both dates present (existing + incoming), duration is
+    re-derived from the final dates instead of trusting a stale value.
     """
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
@@ -1851,6 +2084,18 @@ def update_trip(trip_id: str, trip_in: TripUpdate, db: Session = Depends(get_db)
 
     update_data = trip_in.model_dump(exclude_unset=True)
     update_data.pop("status", None)
+    new_start = update_data.get("start_date", trip.start_date)
+    new_end = update_data.get("end_date", trip.end_date)
+    if new_start is not None and new_end is not None and new_end < new_start:
+        raise HTTPException(status_code=422, detail="Trip end date is before start date")
+    if ("start_date" in update_data or "end_date" in update_data) and "duration_days" not in update_data:
+        # A date edit without an explicit duration: keep the stored duration
+        # consistent with the final dates (manual overrides win).
+        if new_start is not None and new_end is not None:
+            try:
+                update_data["duration_days"] = _trip_duration_from_dates(new_start, new_end)
+            except ValueError:
+                pass
     for field, value in update_data.items():
         old_val = str(getattr(trip, field, ""))
         setattr(trip, field, value)
@@ -2006,6 +2251,8 @@ def ai_extract_preferences(payload: AIExtractPreferencesRequest, db: Session = D
 
     Accepts {text_prompt} or the voice-client alias {text}. Destination
     matching uses live catalog names so new places resolve without Gemini.
+    duration_days is preserved even when no calendar dates were supplied
+    (start_date/end_date stay null) so the review screen can collect dates.
     """
     text = ((payload.text_prompt or "") or (payload.text or "")).strip()
     if not text:
@@ -2016,10 +2263,94 @@ def ai_extract_preferences(payload: AIExtractPreferencesRequest, db: Session = D
                            [d.name for d in db.query(Destination).all()])
     except Exception:
         pass
-    return gemini_service.extract_preferences(
+    result = gemini_service.extract_preferences(
         text_prompt=text,
-        context=context
+        context=context,
     )
+    # Backward-compatible guarantee: duration (no dates) survives the
+    # prompt -> review handoff regardless of provider path.
+    if not isinstance(result, dict):
+        return result
+    result.setdefault("start_date", None)
+    result.setdefault("end_date", None)
+    heur_ground = None
+    try:
+        heur_ground = gemini_service._heuristic_preferences(text, context)
+    except Exception:
+        heur_ground = None
+    if isinstance(heur_ground, dict):
+        # Never let the model invent facts the text does not contain:
+        # origin/counts/dates must be grounded in the prompt itself.
+        # (This is what caused "mumbai"/2/couple on "5 days trip to kerala".)
+        if not heur_ground.get("detected_origin"):
+            result["detected_origin"] = None
+        if heur_ground.get("traveler_count") is None:
+            result["traveler_count"] = None
+        if heur_ground.get("travel_companions") is None:
+            result["travel_companions"] = None
+        if heur_ground.get("budget_amount") is None:
+            result["budget_amount"] = None
+            result["budget_currency"] = None
+            result["budget_tier"] = None
+        for date_key in ("start_date", "end_date"):
+            if not heur_ground.get(date_key):
+                result[date_key] = None
+    # Review-screen convenience: when the frontend sends start_date +
+    # duration_days (e.g. START picked, END still blank), also return the
+    # computed end_date under the app's inclusive convention so the UI can
+    # prefill END immediately without a second call.
+    try:
+        req_start = (payload.context or {}).get("start_date") if isinstance(payload.context, dict) else None
+        req_dur = (payload.context or {}).get("duration_days") if isinstance(payload.context, dict) else None
+        if req_dur is None:
+            req_dur = result.get("duration_days")
+        if req_start and req_dur:
+            _cs = _parse_review_date(req_start)
+            _cd = int(req_dur)
+            if _cs is not None and 1 <= _cd <= 62 and not result.get("end_date"):
+                result["end_date"] = (_cs + timedelta(days=_cd - 1)).isoformat()
+    except Exception:
+        pass
+    return result
+
+
+@router.post("/trips/review-dates")
+def review_trip_dates(payload: Dict[str, Any] = Body(default={})):
+    """Review-screen helper: compute END from START + detected duration.
+
+    Uses the application's inclusive day convention:
+        end_date = start_date + (duration_days - 1)
+    i.e. start 2026-09-27 + 5 days -> end 2026-10-01. Accepts date-only
+    strings (YYYY-MM-DD or DD-MM-YYYY) or datetimes; rejects end<start and
+    non-positive durations with 422. Manual end-date overrides are validated
+    by POST /trips and PUT /trips/{id}, never forced back here.
+    """
+    raw_start = payload.get("start_date")
+    raw_end = payload.get("end_date")
+    raw_duration = payload.get("duration_days")
+    start = _parse_review_date(raw_start)
+    if start is None:
+        raise HTTPException(status_code=422, detail="start_date is required (YYYY-MM-DD)")
+    try:
+        duration = int(raw_duration) if raw_duration is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="duration_days must be a positive integer")
+    if duration is None or duration < 1 or duration > 62:
+        raise HTTPException(status_code=422, detail="duration_days must be between 1 and 62")
+    end = _parse_review_date(raw_end) if raw_end not in (None, "") else None
+    computed_end = start + timedelta(days=duration - 1)
+    if end is not None and end < start:
+        raise HTTPException(status_code=422, detail="Trip end date is before start date")
+    final_end = end if end is not None else computed_end
+    final_duration = (final_end - start).days + 1
+    return {
+        "start_date": start.isoformat(),
+        "end_date": final_end.isoformat(),
+        "computed_end_date": computed_end.isoformat(),
+        "duration_days": final_duration,
+        "requested_duration_days": duration,
+        "end_overridden": end is not None and end != computed_end,
+    }
 
 @router.post("/research", response_model=ResearchResult)
 def research_destination(payload: ResearchContext, db: Session = Depends(get_db)):
@@ -2199,7 +2530,14 @@ def list_trips(status: Optional[str] = None, search: Optional[str] = None,
 
 @router.delete("/trips/{trip_id}")
 def delete_trip(trip_id: str, db: Session = Depends(get_db)):
+    from backend.models.models import TravelerOperatorChatMessage as _Chat
+
     trip = _trip_or_404(db, trip_id)
+    # Explicit chat cleanup: the trips table predates ON DELETE CASCADE in
+    # the live database (migrations never rewrote it), so ORM cascade alone
+    # leaves orphaned chat rows on delete. Chat rows die with their trip.
+    db.query(_Chat).filter(_Chat.trip_id == trip.id).delete(
+        synchronize_session=False)
     db.delete(trip)
     db.commit()
     return {"success": True, "message": "Trip deleted"}
@@ -2397,6 +2735,105 @@ def ops_get_trip(trip_id: str,
     body["traveler"] = _operator_traveler_block(trip)
     body.update(_operator_lifecycle_block(trip, db))
     return body
+
+
+@router.get("/ops/chats/overview")
+def ops_chats_overview(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_operator),
+):
+    """Chat-eligible trips with latest-message/unread preview (operator list)."""
+    from backend.ops.service import chat_overview_for_operator
+
+    _ = current
+    try:
+        return chat_overview_for_operator(db)
+    except Exception as exc:
+        raise _ops_error(exc)
+
+
+@router.get("/ops/trips/{trip_id}/chat")
+def ops_get_trip_chat(
+    trip_id: str, db: Session = Depends(get_db),
+    current: User = Depends(get_current_operator),
+):
+    """Operator view of the SAME shared conversation (operator session)."""
+    from backend.ops.service import (
+        OpsForbidden, can_access_traveler_operator_chat, get_traveler_chat,
+    )
+
+    trip = _chat_trip_or_404(db, trip_id)
+    try:
+        can_access_traveler_operator_chat(db, trip, "operator", current.id)
+        return get_traveler_chat(db, trip, viewer="operator")
+    except OpsForbidden as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise _ops_error(exc)
+
+
+@router.post("/ops/trips/{trip_id}/chat")
+def ops_init_trip_chat(
+    trip_id: str, payload: Dict[str, Any] = Body(default={}),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_operator),
+):
+    """Idempotent init: first operator message starts the thread; when
+    messages already exist the latest is returned (no duplicates)."""
+    from backend.ops.service import (
+        OpsForbidden, can_access_traveler_operator_chat, get_traveler_chat,
+        post_chat_message,
+    )
+
+    trip = _chat_trip_or_404(db, trip_id)
+    try:
+        can_access_traveler_operator_chat(db, trip, "operator", current.id)
+    except OpsForbidden as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise _ops_error(exc)
+    try:
+        existing = get_traveler_chat(db, trip, viewer="operator")
+        if existing.get("messages"):
+            return existing["messages"][-1]
+        raw = payload.get("body") if isinstance(payload, dict) else None
+        body = (raw or "").strip() or (
+            "Hello! Your trip is confirmed — how can I help you prepare?")
+        return post_chat_message(
+            db, trip, "operator", current.id,
+            getattr(current, "full_name", None) or getattr(current, "email", None),
+            body,
+        )
+    except Exception as exc:
+        raise _ops_error(exc)
+
+
+@router.post("/ops/trips/{trip_id}/chat/messages")
+def ops_post_trip_chat_message(
+    trip_id: str, payload: OperatorChatMessageCreate,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_operator),
+):
+    """Operator reply on the SAME shared conversation."""
+    from backend.ops.service import (
+        OpsForbidden, can_access_traveler_operator_chat, post_chat_message,
+    )
+
+    trip = _chat_trip_or_404(db, trip_id)
+    try:
+        can_access_traveler_operator_chat(db, trip, "operator", current.id)
+    except OpsForbidden as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise _ops_error(exc)
+    try:
+        return post_chat_message(
+            db, trip, "operator", current.id,
+            getattr(current, "full_name", None) or getattr(current, "email", None),
+            (payload.body or "").strip(),
+        )
+    except Exception as exc:
+        raise _ops_error(exc)
 
 
 @router.get("/operator/dashboard")
@@ -2676,6 +3113,103 @@ def _backfill_item_image(item: Any, destination_name: Optional[str]) -> None:
         pass
 
 
+def _parse_optional_coord(value: Any, low: float, high: float) -> Optional[float]:
+    """Parse an optional latitude/longitude payload value; None when absent/invalid.
+
+    Never raises — a bad coordinate means "unknown", never a 500.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (low <= parsed <= high):
+        return None
+    return parsed
+
+
+def _valid_coords(lat: Any, lng: Any) -> Optional[tuple]:
+    """Return (lat, lng) floats when both are in range, else None. Never raises."""
+    try:
+        lat_f, lng_f = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat_f <= 90 and -180 <= lng_f <= 180):
+        return None
+    return lat_f, lng_f
+
+
+def _resolve_activity_coordinates(
+    db: Session,
+    trip: Any,
+    title: str,
+    payload: Dict[str, Any],
+) -> tuple:
+    """Resolve (lat, lng) for a manually added/swapped activity.
+
+    Priority (existing infrastructure only, no new geocoding system):
+    1. Explicit payload latitude/longitude (or meta.ui.*) — preserved as-is.
+    2. ``activity_id`` catalog lookup — reuse Activity.latitude/longitude so
+       catalog/discovered attractions resolve exactly like generated items.
+    3. Title match against the trip destination's catalog activities — covers
+       free-text adds that name a known place (e.g. "Gateway of India").
+    4. Nominatim ``geocode_place`` (the project's existing provider in
+       backend/places/service.py) scoped to "<title>, <destination>" —
+       failures return None (never fabricated, never raises).
+    """
+    explicit_lat = _parse_optional_coord(
+        payload.get("latitude", (payload.get("ui") or {}).get("latitude") if isinstance(payload.get("ui"), dict) else None),
+        -90, 90,
+    )
+    explicit_lng = _parse_optional_coord(
+        payload.get("longitude", (payload.get("ui") or {}).get("longitude") if isinstance(payload.get("ui"), dict) else None),
+        -180, 180,
+    )
+    if explicit_lat is not None and explicit_lng is not None:
+        return explicit_lat, explicit_lng
+
+    clean_title = (title or "").strip()
+    activity_id = payload.get("activity_id")
+    catalog_activity = None
+    try:
+        if activity_id:
+            catalog_activity = db.query(Activity).filter(Activity.id == activity_id).first()
+        if catalog_activity is None and clean_title and getattr(trip, "destination_id", None):
+            # Exact title match only: a free-text add must resolve to the
+            # same catalog place, never to a partially matching one.
+            # ilike() with no wildcards behaves as a case-insensitive "=".
+            catalog_activity = db.query(Activity).filter(
+                Activity.destination_id == trip.destination_id,
+                Activity.title.ilike(clean_title),
+            ).first()
+    except Exception:
+        catalog_activity = None
+    if catalog_activity is not None:
+        resolved = _valid_coords(getattr(catalog_activity, "latitude", None), getattr(catalog_activity, "longitude", None))
+        if resolved:
+            return resolved
+
+    # Nominatim fallback (existing keyless provider). Best-effort: any
+    # failure or unresolvable name yields (None, None) and the activity
+    # stays in the itinerary/map as unmapped.
+    try:
+        from backend.places.service import geocode_place
+
+        dest_name = _destination_name(trip)
+        query = f"{clean_title}, {dest_name}" if dest_name else clean_title
+        if not query:
+            return None, None
+        geo = geocode_place(query, settings.NOMINATIM_API_URL, settings.PLACES_TIMEOUT_S)
+        if geo:
+            resolved = _valid_coords(geo[0], geo[1])
+            if resolved:
+                return resolved
+    except Exception:
+        pass
+    return None, None
+
+
 def _destination_name(trip: Any) -> Optional[str]:
     try:
         name = getattr(getattr(trip, "destination", None), "name", None)
@@ -2745,12 +3279,35 @@ def add_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: S
     if not title:
         raise HTTPException(status_code=422, detail="Activity title is required")
     day = int(payload.get("day_number") or 1)
-    item = ItineraryItem(trip_id=trip.id, day_number=day,
+    activity_id = payload.get("activity_id")
+    catalog_activity = None
+    if activity_id:
+        try:
+            catalog_activity = db.query(Activity).filter(Activity.id == activity_id).first()
+        except Exception:
+            catalog_activity = None
+    # Resolve coordinates BEFORE building meta so they persist on the item
+    # (explicit payload > catalog activity_id/title match > Nominatim).
+    # Never raises; (None, None) means unmapped-but-kept.
+    lat, lng = _resolve_activity_coordinates(db, trip, title, payload)
+    ui_meta: Dict[str, Any] = {k: payload[k] for k in ("image_url", "duration", "walking_intensity", "rest_buffer_minutes") if k in payload}
+    if lat is not None and lng is not None:
+        ui_meta["latitude"] = lat
+        ui_meta["longitude"] = lng
+    item_kwargs: Dict[str, Any] = dict(
+        trip_id=trip.id, day_number=day,
         order_index=max([i.order_index for i in trip.itinerary if i.day_number == day] or [0]) + 1,
         item_type=payload.get("item_type") or "activity", title=title, description=payload.get("description"),
         start_time=payload.get("start_time"), end_time=payload.get("end_time"), cost=float(payload.get("cost") or 0),
         location=payload.get("location"), status="confirmed",
-        meta_data={"ui": {k: payload[k] for k in ("image_url", "duration", "walking_intensity", "rest_buffer_minutes") if k in payload}})
+        meta_data={"ui": ui_meta})
+    # Link the catalog row when known so the map (and future reads) resolve
+    # coordinates even if ui meta is ever cleared.
+    if catalog_activity is not None:
+        item_kwargs["activity_id"] = catalog_activity.id
+        if not item_kwargs["location"]:
+            item_kwargs["location"] = catalog_activity.meeting_point
+    item = ItineraryItem(**item_kwargs)
     db.add(item)
     if not payload.get("image_url"):
         _backfill_item_image(item, _destination_name(trip))
@@ -2773,8 +3330,36 @@ def swap_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: 
     item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Itinerary item not found")
+    title_changed = bool(payload.get("new_title"))
+    new_activity_id = payload.get("new_activity_id") or payload.get("activity_id")
+    new_catalog = None
+    if new_activity_id:
+        try:
+            new_catalog = db.query(Activity).filter(Activity.id == new_activity_id).first()
+        except Exception:
+            new_catalog = None
     for field in ("title", "description", "cost"):
         if payload.get(f"new_{field}") is not None: setattr(item, field, payload[f"new_{field}"])
+    meta = dict(item.meta_data or {})
+    ui = dict(meta.get("ui", {}) or {})
+    if new_catalog is not None:
+        item.activity_id = new_catalog.id
+        if not item.location:
+            item.location = new_catalog.meeting_point
+        resolved = _valid_coords(new_catalog.latitude, new_catalog.longitude)
+        if resolved:
+            ui["latitude"], ui["longitude"] = resolved
+    elif title_changed:
+        # Title changed without a catalog link: drop stale coords/photo so
+        # the map re-resolves for the NEW place instead of the old one.
+        ui.pop("latitude", None)
+        ui.pop("longitude", None)
+        lat, lng = _resolve_activity_coordinates(
+            db, trip, item.title, {"activity_id": getattr(item, "activity_id", None)})
+        if lat is not None and lng is not None:
+            ui["latitude"], ui["longitude"] = lat, lng
+    meta["ui"] = ui
+    item.meta_data = meta
     if payload.get("new_image_url"):
         item.meta_data = {**(item.meta_data or {}), "ui": {**(item.meta_data or {}).get("ui", {}), "image_url": payload["new_image_url"]}}
     else:
@@ -2799,8 +3384,38 @@ def edit_activity(trip_id: str, payload: Dict[str, Any] = Body(default={}), db: 
     item = db.query(ItineraryItem).filter(ItineraryItem.id == payload.get("item_id"), ItineraryItem.trip_id == trip.id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Itinerary item not found")
+    title_will_change = "title" in payload and payload["title"] is not None \
+        and str(payload["title"]).strip() != (item.title or "")
     for field in ("title", "description", "start_time", "end_time", "cost"):
         if field in payload and payload[field] is not None: setattr(item, field, payload[field])
+    explicit_lat = _parse_optional_coord(payload.get("latitude"), -90, 90)
+    explicit_lng = _parse_optional_coord(payload.get("longitude"), -180, 180)
+    if explicit_lat is not None and explicit_lng is not None:
+        meta = dict(item.meta_data or {})
+        ui = dict(meta.get("ui", {}) or {})
+        ui["latitude"], ui["longitude"] = explicit_lat, explicit_lng
+        meta["ui"] = ui
+        item.meta_data = meta
+    elif title_will_change:
+        # Title edits must not leave stale pins: re-resolve for the new
+        # identity (catalog title-match/Nominatim) or clear to unmapped.
+        meta = dict(item.meta_data or {})
+        ui = dict(meta.get("ui", {}) or {})
+        ui.pop("latitude", None)
+        ui.pop("longitude", None)
+        lat, lng = _resolve_activity_coordinates(
+            db, trip, item.title, {"activity_id": getattr(item, "activity_id", None)})
+        if lat is not None and lng is not None:
+            ui["latitude"], ui["longitude"] = lat, lng
+        meta["ui"] = ui
+        item.meta_data = meta
+    # Day moves keep existing pins: the map reads the current day
+    # association, and ordering within the day is preserved by order_index.
+    if "day_number" in payload and payload["day_number"] is not None:
+        try:
+            item.day_number = int(payload["day_number"])
+        except (TypeError, ValueError):
+            pass
     return _commit_trip(db, trip, "activity_edited", "itinerary", item.title, "Traveler edited an itinerary activity.")
 
 
@@ -2885,6 +3500,23 @@ def add_restaurant(trip_id: str, payload: AddRestaurantRequest, request: Request
         status="confirmed",
         meta_data=meta,
     )
+    # Persist coordinates on the meal item so the map pins it like any
+    # activity (explicit payload > catalog title-match > Nominatim).
+    try:
+        meal_lat = _parse_optional_coord(payload.latitude, -90, 90)
+        meal_lng = _parse_optional_coord(payload.longitude, -180, 180)
+        if meal_lat is None or meal_lng is None:
+            meal_lat, meal_lng = _resolve_activity_coordinates(
+                db, trip, payload.name.strip(), {})
+        if meal_lat is not None and meal_lng is not None:
+            meal_meta = dict(item.meta_data or {})
+            meal_ui = dict(meal_meta.get("ui", {}) or {})
+            meal_ui["latitude"] = meal_lat
+            meal_ui["longitude"] = meal_lng
+            meal_meta["ui"] = meal_ui
+            item.meta_data = meal_meta
+    except Exception:
+        pass
     db.add(item)
     if not payload.image_url:
         _backfill_item_image(item, _destination_name(trip))

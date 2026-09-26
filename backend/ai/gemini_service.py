@@ -121,7 +121,43 @@ class GeminiService:
         dur = None
         dur_match = re.search(r"(\d+)\s*-?\s*(?:day|days)", prompt_lower)
         if dur_match:
-            dur = int(dur_match.group(1))
+            try:
+                dur = max(1, int(dur_match.group(1)))
+            except (TypeError, ValueError):
+                dur = None
+        if dur is None:
+            # Word-number durations: "trip for five days", "a five-day trip".
+            word_numbers = {
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+                "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+                "nineteen": 19, "twenty": 20, "thirty": 30,
+            }
+            word_match = re.search(
+                r"\b(one|two|three|four|five|six|seven|eight|nine|ten|"
+                r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+                r"seventeen|eighteen|nineteen|twenty|thirty)"
+                r"\s*-?\s*(?:day|days)\b",
+                prompt_lower,
+            )
+            if word_match:
+                dur = word_numbers.get(word_match.group(1))
+
+        origin = None
+        origin_match = re.search(r"\bfrom\s+([a-z][a-z\s\-']{1,60})", prompt_lower)
+        if origin_match:
+            candidate = origin_match.group(1).strip()
+            # Trim trailing clauses ("for 5 days", "to goa", "in june").
+            candidate = re.split(
+                r"\b(?:to|for|in|on|during|with|under|around|about|and|of)\b",
+                candidate,
+            )[0].strip(" ,.-")
+            # Guard against "from friends/family/there" style false positives.
+            if candidate and candidate not in (
+                "friends", "friend", "family", "there", "here", "home", "now",
+            ):
+                origin = " ".join(word.capitalize() for word in candidate.split())
 
         pace = None
         if any(k in prompt_lower for k in ["slow", "relaxed", "leisurely", "easy pace", "chill"]):
@@ -133,6 +169,9 @@ class GeminiService:
 
         return {
             "detected_destination": dest,
+            "detected_origin": origin,
+            "start_date": None,
+            "end_date": None,
             "budget_tier": budget,
             "budget_amount": budget_amount,
             "budget_currency": budget_currency,
@@ -152,6 +191,8 @@ class GeminiService:
         if not self.is_available() or not self.client:
             result = self._heuristic_preferences(text_prompt, context)
             result["source"] = "fallback_extractor"
+            result.setdefault("start_date", None)
+            result.setdefault("end_date", None)
             return result
 
         try:
@@ -175,12 +216,17 @@ class GeminiService:
             - NEVER pull values from system prompt examples, placeholder text, or pre-filled template strings.
             - If budget is not specified by the user, set budget: null and budget_tier: null.
             - If destination is not specified by the user, set detected_destination: null.
+            - If the starting city is not specified by the user, set detected_origin: null.
+            - If no calendar dates are specified by the user, set start_date: null and end_date: null.
             - If duration_days is not specified by the user, set duration_days: null.
             - If travel_companions is not specified by the user, set travel_companions: null.
 
             Return strictly valid JSON with this schema:
             {{
                 "detected_destination": string or null,
+                "detected_origin": string or null,
+                "start_date": string or null,
+                "end_date": string or null,
                 "budget_tier": "budget" | "moderate" | "luxury" | "ultra_luxury" | null,
                 "interests": list of strings,
                 "travel_companions": "solo" | "couple" | "family" | "friends" | null,
@@ -218,10 +264,15 @@ class GeminiService:
             # amounts, durations, explicit destination names) so the
             # contract holds regardless of provider.
             heur = self._heuristic_preferences(text_prompt, context)
-            for key in ("detected_destination", "budget_amount",
+            for key in ("detected_destination", "detected_origin", "budget_amount",
                         "budget_currency", "traveler_count", "duration_days"):
                 if data.get(key) is None and heur.get(key) is not None:
                     data[key] = heur[key]
+            # Dates stay null unless explicitly supplied: duration without
+            # calendar dates must survive to the review screen.
+            for date_key in ("start_date", "end_date"):
+                if not data.get(date_key):
+                    data[date_key] = None
             return data
         except Exception as e:
             logger.error(f"Gemini preference extraction error: {e}")
@@ -230,6 +281,8 @@ class GeminiService:
             result = self._heuristic_preferences(text_prompt, context)
             result["error"] = str(e)[:200]
             result["source"] = "fallback_on_error"
+            result.setdefault("start_date", None)
+            result.setdefault("end_date", None)
             return result
 
     def recommend(self, preferences: Dict[str, Any], destination_id: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
