@@ -2096,34 +2096,25 @@ def _chat_approval(db: Session, trip_id: str):
 
 
 def chat_status(db: Session, trip: Trip) -> Dict[str, Any]:
-    """Machine-readable chat availability for one trip (no sensitive data)."""
+    """Machine-readable chat availability for one trip (no sensitive data).
+
+    Chat is enabled once the traveler confirms the trip (status confirmed/
+    ongoing). Planning/draft trips have chat unavailable. Operator
+    acceptance/assignment is NOT required for chat.
+    """
     status = (getattr(trip, "status", None) or "").strip().lower()
-    traveler_confirmed = status in ("confirmed", "ongoing") and bool(
-        getattr(trip, "confirmed_at", None)
-    )
-    if not traveler_confirmed:
+    if status in ("confirmed", "ongoing"):
         return {
-            "enabled": False,
-            "state": CHAT_DISABLED_TRAVELER_PENDING,
-            "traveler_confirmed": False,
-            "operator_accepted": False,
-        }
-    approval = _chat_approval(db, trip.id)
-    operator_accepted = bool(
-        approval is not None and approval.approved and approval.assignment_started
-    )
-    if not operator_accepted:
-        return {
-            "enabled": False,
-            "state": CHAT_DISABLED_OPERATOR_PENDING,
+            "enabled": True,
+            "state": "active",
             "traveler_confirmed": True,
-            "operator_accepted": False,
+            "operator_accepted": True,
         }
     return {
-        "enabled": True,
-        "state": "active",
-        "traveler_confirmed": True,
-        "operator_accepted": True,
+        "enabled": False,
+        "state": CHAT_DISABLED_TRAVELER_PENDING,
+        "traveler_confirmed": False,
+        "operator_accepted": False,
     }
 
 
@@ -2340,23 +2331,44 @@ def post_chat_message(
 
 
 def chat_overview_for_operator(db: Session) -> List[Dict[str, Any]]:
-    """Chat-eligible trips with latest-message/unread preview (operator list)."""
+    """All trips with chat status + traveler/account + trip details.
+
+    New itineraries automatically appear here — the trip itself is the
+    conversation/thread identity. Each entry carries the real backend
+    traveler account and trip data so the operator sees full context
+    without a separate communication record.
+    """
+    from backend.models.models import User as _User, Destination as _Destination
+
     trips = db.query(Trip).order_by(Trip.updated_at.desc()).all()
     out = []
     for trip in trips:
         status = chat_status(db, trip)
-        if not status["enabled"]:
-            continue
-        messages = _chat_messages_for(db, trip.id, "operator")
+        enabled = status["enabled"]
+        messages = _chat_messages_for(db, trip.id, "operator") if enabled else []
         latest = messages[-1] if messages else None
+        traveler = db.query(_User).filter(_User.id == trip.user_id).first()
+        destination = db.query(_Destination).filter(_Destination.id == trip.destination_id).first()
         out.append(
             {
                 "trip_id": trip.id,
                 "title": trip.title,
                 "status": trip.status,
-                "traveler": _chat_participants(db, trip)["traveler"],
+                "chat_enabled": enabled,
+                "chat_state": status["state"],
+                "traveler": {
+                    "id": trip.user_id,
+                    "name": traveler.full_name if traveler else None,
+                    "email": traveler.email if traveler else None,
+                },
+                "destination": destination.name if destination else None,
+                "origin": trip.origin,
+                "traveler_count": trip.traveler_count,
+                "start_date": trip.start_date.isoformat() if trip.start_date else None,
+                "end_date": trip.end_date.isoformat() if trip.end_date else None,
+                "duration_days": trip.duration_days,
                 "message_count": len(messages),
-                "unread_count": _chat_unread_count(db, trip.id, "operator"),
+                "unread_count": _chat_unread_count(db, trip.id, "operator") if enabled else 0,
                 "latest_message": latest,
                 "latest_at": latest["created_at"] if latest else None,
             }

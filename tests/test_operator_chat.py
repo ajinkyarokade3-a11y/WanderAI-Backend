@@ -111,19 +111,28 @@ def test_chat_rejected_before_traveler_confirmation(operator_headers):
             client.delete(f"/api/trips/{trip_id}")
 
 
-def test_chat_rejected_before_operator_acceptance(operator_headers):
+def test_confirmed_trip_chat_returns_200_without_operator_acceptance(operator_headers):
+    """Regression: CONFIRMED trip -> chat 200/enabled WITHOUT operator approval."""
     user, token = _signup_traveler()
     trip_id = None
     try:
         trip_id = _make_confirmable_trip(user["id"])
         assert client.post(f"/api/trips/{trip_id}/confirm",
                            json={"user_id": user["id"]}).status_code == 200
-        assert client.post(f"/api/ops/trips/{trip_id}/approve",
-                           json={}, headers=operator_headers).status_code == 200
+        # NO approve/accept calls — chat must still be available
         res = client.get(f"/api/trips/{trip_id}/chat",
                          headers=_traveler_headers(token))
-        assert res.status_code == 409
-        assert res.json()["detail"].endswith("waiting_for_operator_acceptance")
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["enabled"] is True
+        assert body["state"] == "active"
+        assert body["messages"] == []
+        # Traveler can send immediately
+        sent = client.post(f"/api/trips/{trip_id}/chat/messages",
+                           json={"body": "Hello operator"},
+                           headers=_traveler_headers(token))
+        assert sent.status_code == 200, sent.text
+        assert sent.json()["sender_type"] == "traveler"
     finally:
         if trip_id:
             client.delete(f"/api/trips/{trip_id}")
