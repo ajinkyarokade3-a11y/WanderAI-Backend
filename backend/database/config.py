@@ -94,6 +94,22 @@ class Settings(BaseSettings):
     WEATHER_TIMEOUT_S: float = 8.0
     WEATHER_CACHE_TTL_S: int = 600
     WEATHER_DAYS_DEFAULT: int = 5
+    # Social signals (external/public signals for disruption context). Empty
+    # base URL disables the service; endpoints report provider-unavailable.
+    SOCIAL_BASE_URL: str = ""
+    SOCIAL_API_KEY: str = ""
+    SOCIAL_TIMEOUT_S: float = 8.0
+    SOCIAL_CACHE_TTL_S: int = 300
+    # GDELT provider (no API key required)
+    GDELT_BASE_URL: str = "https://api.gdeltproject.org/api/v2/doc/doc"
+    GDELT_TIMEOUT_S: float = 15.0
+    GDELT_MAX_RESULTS: int = 50
+    GDELT_TIME_WINDOW_HOURS: int = 72
+    # Bluesky provider (public API, no auth required)
+    BLUESKY_BASE_URL: str = "https://public.api.bsky.app"
+    BLUESKY_TIMEOUT_S: float = 15.0
+    BLUESKY_MAX_RESULTS: int = 50
+    BLUESKY_TIME_WINDOW_HOURS: int = 72
     # Traveler password login (JWT). Override TRAVELER_JWT_SECRET in production;
     # the built-in default is development-only.
     TRAVELER_JWT_SECRET: str = "dev-only-traveler-jwt-secret-change-in-production"

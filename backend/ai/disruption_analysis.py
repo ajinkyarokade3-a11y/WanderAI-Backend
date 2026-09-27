@@ -212,7 +212,7 @@ def _gather_trip_context(db: Session, trip: Trip) -> Dict[str, Any]:
                 "price": t.price,
             })
 
-    return {
+    context = {
         "trip_id": trip.id,
         "destination": trip.destination.name if trip.destination else None,
         "duration_days": trip.duration_days,
@@ -226,6 +226,52 @@ def _gather_trip_context(db: Session, trip: Trip) -> Dict[str, Any]:
         "catalog_activities": catalog_activities,
         "transport_options": transport_options,
     }
+
+    # Inject live weather context for the trip's destination.
+    # Never fabricated; unavailable state is passed when provider fails.
+    context["weather_context"] = _fetch_weather_context(db, trip)
+
+    # Inject social signals context for the trip's destination.
+    # Never fabricated; unavailable state is passed when provider fails.
+    context["social_context"] = _fetch_social_signals_context(db, trip)
+
+    return context
+
+
+def _fetch_weather_context(db: Session, trip: Trip) -> Dict[str, Any]:
+    """Fetch structured weather context for the trip's destination.
+
+    Returns ``{"available": True, "current": {...}, "forecast": [...], ...}``
+    on success, or ``{"available": False, "reason": "..."}`` on failure.
+    Never raises; all failures return an unavailable state.
+    """
+    try:
+        from backend.database.config import settings as _settings
+        from backend.weather.service import get_weather_for_trip
+        if not _settings.WEATHER_BASE_URL.strip():
+            return {"available": False, "reason": "not_configured"}
+        return get_weather_for_trip(
+            db, trip,
+            _settings.WEATHER_BASE_URL,
+            _settings.WEATHER_TIMEOUT_S,
+            api_key=_settings.WEATHER_API_KEY,
+        )
+    except Exception:
+        return {"available": False, "reason": "provider_unavailable"}
+
+
+def _fetch_social_signals_context(db: Session, trip: Trip) -> Dict[str, Any]:
+    """Fetch structured social signals context for the trip's destination.
+
+    Returns ``{"available": True, "signals": [...], "overall_risk": "...", ...}``
+    on success, or ``{"available": False, "reason": "..."}`` on failure.
+    Never raises; all failures return an unavailable state.
+    """
+    try:
+        from backend.social_signals.service import get_social_signals_for_trip_aggregated
+        return get_social_signals_for_trip_aggregated(db, trip)
+    except Exception:
+        return {"available": False, "reason": "provider_unavailable"}
 
 
 def _build_prompt(trip_context: Dict[str, Any], disruption: Dict[str, Any]) -> str:

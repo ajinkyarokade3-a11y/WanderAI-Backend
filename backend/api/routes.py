@@ -61,6 +61,7 @@ from backend.auth.service import get_current_operator
 from backend.replanning.engine import ReplanningEngine
 from backend.ai.disruption_analysis import analyze_disruption
 from backend.schemas.schemas import DisruptionAnalysisRequest
+from backend.simulation.schemas import SimulationRequest
 import logging
 import os
 import re
@@ -1928,6 +1929,22 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Trip not found")
     return _trip_dict(trip, db)
 
+@router.get("/trips/{trip_id}/weather")
+def trip_weather(trip_id: str, db: Session = Depends(get_db)):
+    """Live weather + forecast for the trip's destination coordinates."""
+    from backend.weather.service import get_weather_for_trip
+    trip = _trip_or_404(db, trip_id)
+    if not settings.WEATHER_BASE_URL.strip():
+        return {"available": False, "error": {"code": "WEATHER_NOT_CONFIGURED", "message": "Weather provider is not configured."}}
+    return get_weather_for_trip(db, trip, settings.WEATHER_BASE_URL, settings.WEATHER_TIMEOUT_S, api_key=settings.WEATHER_API_KEY)
+
+@router.get("/trips/{trip_id}/social-signals")
+def trip_social_signals(trip_id: str, db: Session = Depends(get_db)):
+    """Social signals for the trip's destination via multi-provider aggregator."""
+    from backend.social_signals.service import get_social_signals_for_trip_aggregated
+    trip = _trip_or_404(db, trip_id)
+    return get_social_signals_for_trip_aggregated(db, trip)
+
 @router.get("/trips/{trip_id}/map")
 def trip_map(trip_id: str, db: Session = Depends(get_db)):
     """Map-ready itinerary: days with plotted stops (real coordinates only).
@@ -2680,6 +2697,24 @@ def disruption_analysis(trip_id: str, payload: DisruptionAnalysisRequest = Body(
     db.commit()
 
     return analysis
+
+
+@router.post("/trips/{trip_id}/simulate")
+def simulate_trip(trip_id: str, payload: SimulationRequest = Body(default=...),
+                  db: Session = Depends(get_db)):
+    """Run a weather-driven what-if simulation for a trip.
+
+    Returns a structured simulation identifying affected items, dependency
+    chains, timing conflicts, and whether replanning may be required.
+    Does NOT modify the real itinerary.
+    """
+    from backend.simulation.service import simulate_trip_weather_impact
+    from backend.ai.disruption_analysis import _fetch_weather_context
+
+    trip = _trip_or_404(db, trip_id)
+    weather_context = _fetch_weather_context(db, trip)
+    result = simulate_trip_weather_impact(db, trip, weather_context, scenario=payload.scenario)
+    return result
 
 
 @router.post("/trips/{trip_id}/dismiss-disruption")
