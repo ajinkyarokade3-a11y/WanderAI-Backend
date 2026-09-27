@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,7 +44,16 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://localhost:3002",
     "http://127.0.0.1:3002",
+    "https://operator-web-puce.vercel.app",
 ]
+
+_env_origins = os.environ.get("CORS_ORIGINS", "")
+if _env_origins:
+    ALLOWED_ORIGINS.extend(
+        origin.strip()
+        for origin in _env_origins.split(",")
+        if origin.strip()
+    )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
