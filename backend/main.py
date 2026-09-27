@@ -44,6 +44,9 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://localhost:3002",
     "http://127.0.0.1:3002",
+    "http://localhost",
+    "http://127.0.0.1",
+    "https://operator-web.vercel.app",
     "https://operator-web-puce.vercel.app",
 ]
 
