@@ -52,7 +52,7 @@ class ItineraryCrew:
                 "activity IDs. Never reuse an activity ID on another day. Do not invent IDs, catalog facts, "
                 "prices, schedules, availability, booking, accommodation, transport, or activities."
             ),
-            expected_output="Only JSON matching the required itinerary-selection object; no markdown or prose.",
+            expected_output="Only the JSON matching the required itinerary-selection object; no markdown or prose.",
             agent=agent, output_pydantic=ItineraryCrewOutput,
         )
         output = Crew(agents=[agent], tasks=[task], process=Process.sequential).kickoff(inputs={
