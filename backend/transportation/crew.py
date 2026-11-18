@@ -47,7 +47,7 @@ class TransportationCrew:
                 "Never return an ID absent from candidates and never invent transport inventory, routes, prices, "
                 "capacity, availability, booking, accommodation, activities, or itinerary content."
             ),
-            expected_output="Only JSON matching the required selections object; no markdown or prose.",
+            expected_output="Only the JSON matching the required selections object; no markdown or prose.",
             agent=agent, output_pydantic=TransportationCrewOutput,
         )
         output = Crew(agents=[agent], tasks=[task], process=Process.sequential).kickoff(inputs={
