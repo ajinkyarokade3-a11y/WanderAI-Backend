@@ -10,7 +10,7 @@ from backend.models.models import Activity, Hotel, TransportOption
 
 
 class RecommendationEngine:
-    """Rank active catalog candidates while keeping Gemini supplementary."""
+    """Rank the active catalog candidates while keeping Gemini supplementary."""
 
     # Proximity component of the hotel score (added to the existing 100).
     # Weight 10 matches the smallest existing components, so geography can
