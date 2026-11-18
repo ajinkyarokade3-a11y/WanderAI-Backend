@@ -4,7 +4,7 @@ Flow per message:
 1. Verify ownership (user_id, trip_id).
 2. Persist the user message.
 3. Load recent messages (latest 10-20) for this user + trip.
-4. Build trip context via GuideContextService (today/tomorrow/bookings/budget).
+4. Build trip context via the GuideContextService (today/tomorrow/bookings/budget).
 5. Generate grounded response (Gemini when available, else deterministic fallback).
 6. Parse optional structured action, validate IDs against the active trip, execute.
 7. Persist the AI response. Never lose the user message on AI failure.
