@@ -14,7 +14,7 @@ import httpx
 
 
 class SerpApiError(Exception):
-    """Raised when the SerpApi request fails or returns unusable data."""
+    """Raised when SerpApi request fails or returns unusable data."""
 
 
 def _redact_key(text: Any) -> str:
