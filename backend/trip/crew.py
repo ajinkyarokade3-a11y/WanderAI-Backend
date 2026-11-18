@@ -51,7 +51,7 @@ class TripManagementCrew:
                 "Never return an ID absent from the catalog. Never invent prices, availability, booking "
                 "references, payment status, inventory, or changes to the existing trip."
             ),
-            expected_output="Only JSON matching the required trip-management-selection object; no markdown or prose.",
+            expected_output="Only the JSON matching the required trip-management-selection object; no markdown or prose.",
             agent=agent, output_pydantic=TripManagementCrewOutput,
         )
         output = Crew(agents=[agent], tasks=[task], process=Process.sequential).kickoff(inputs={
