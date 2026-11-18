@@ -18,7 +18,7 @@
 - `GET /api/destinations/featured`
   - Returns featured destinations (`is_featured=true`) ordered by name.
 - `GET /api/destinations/categories`
-  - Returns `{ categories: string[], total }` derived from distinct tags in DB.
+  - Returns `{ categories: string[], total }` derived from distinct tags in the DB.
 - `GET /api/destinations/nearby?latitude=&longitude=&radius_km=500&limit=20`
   - Returns destinations within `radius_km` using actual coordinates, sorted by distance, with `distance_km` field. Validates `latitude` -90..90, `longitude` -180..180 (`422` on invalid). Uses haversine, no external maps.
 - `GET /api/destinations/{id}`
